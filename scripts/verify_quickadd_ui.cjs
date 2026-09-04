@@ -4,7 +4,7 @@ const {window}=parseHTML(fs.readFileSync('src/web/index.html','utf8'));
 const document=window.document;window.location={hash:''};
 let response={path:'C:\\Users\\Test\\.kimi-code\\config.toml',token:'fixture'},ok=true,calls=[];
 const sandbox={document,window,console,Promise,setTimeout(){return 0;},clearTimeout(){},fetch:async(path,init)=>{calls.push({path,init});return {ok,json:async()=>response};}};
-const source=fs.readFileSync('src/web/app.js','utf8').replace('  if (document.readyState === "loading") {','  globalThis.testing = {showView, applyQuickAdd};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
+const source=fs.readFileSync('src/web/app.js','utf8').replace(/\r\n/g,'\n').replace('  if (document.readyState === "loading") {','  globalThis.testing = {showView, applyQuickAdd};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
 vm.runInNewContext(source,sandbox);
 const flush=()=>new Promise(r=>setImmediate(r));
 (async()=>{

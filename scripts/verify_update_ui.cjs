@@ -8,7 +8,7 @@ const sandbox={window,document,console,Promise,setTimeout(fn,ms){if(ms===1000)po
  if(init?.method==='POST'){assert.equal(JSON.parse(init.body).token,'test-token');posts++;}
  return {ok:true,status:200,json:async()=>data,text:async()=>JSON.stringify(data)};
 }};
-let source=fs.readFileSync('src/web/app.js','utf8').replace('  if (document.readyState === "loading") {','  globalThis.testing = {initUpdates};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
+let source=fs.readFileSync('src/web/app.js','utf8').replace(/\r\n/g,'\n').replace('  if (document.readyState === "loading") {','  globalThis.testing = {initUpdates};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
 vm.runInNewContext(source,sandbox);const tick=()=>new Promise(r=>setImmediate(r));
 (async()=>{
  sandbox.testing.initUpdates();await tick();assert(document.getElementById('update-area').hidden);assert.equal(polls.length,1);

@@ -2499,7 +2499,7 @@ fn loopbackStream(io: std.Io, port: u16) !Net.Stream {
 fn testPort(base: u16) u16 {
     const pid: u64 = switch (builtin.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
-        else => @intCast(std.posix.getpid()),
+        else => @intCast(std.c.getpid()),
     };
     return base + @as(u16, @intCast(pid % 2000));
 }

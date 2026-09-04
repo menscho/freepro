@@ -9,7 +9,7 @@ window.Element.prototype.getBoundingClientRect=()=>({width:700,height:226,left:0
 Object.defineProperty(window.HTMLSelectElement.prototype,'value',{configurable:true,get(){return this._testValue||this.querySelector('option')?.getAttribute('value')||'';},set(v){this._testValue=v;}});
 const sandbox={document,window,console,URL,Blob,AbortController,Promise,setTimeout(){return 0;},clearTimeout(){},fetch:async()=>({ok:true,status:200,text:async()=>'{}'})};
 window.location={hash:''};window.devicePixelRatio=1;
-const source=fs.readFileSync('src/web/app.js','utf8').replace('  if (document.readyState === "loading") {','  globalThis.testing = {state, usageData, renderUsage, initUsage, showView};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
+const source=fs.readFileSync('src/web/app.js','utf8').replace(/\r\n/g,'\n').replace('  if (document.readyState === "loading") {','  globalThis.testing = {state, usageData, renderUsage, initUsage, showView};\n  if (false) {').replace('    init();\n  }\n})();','  }\n})();');
 vm.runInNewContext(source,sandbox);
 const t=sandbox.testing,today=Math.floor(Date.now()/86400000);
 t.state.usage={total_in:2000,total_out:500,total_cached:300,total_requests:20,days:[{day:today,in:1000,out:300,cached:200,requests:10},{day:today-1,in:500,out:100,cached:80,requests:5}],models:[{model:'oc/muse-spark',input:1200,output:300,cached:250,requests:12,days:[{day:today,input:700,output:200,cached:100,requests:7},{day:today-1,input:500,output:100,cached:150,requests:5}]},{model:'kilo/deepseek',input:300,output:100,cached:50,requests:3,days:[{day:today,input:300,output:100,cached:50,requests:3}]}]};
