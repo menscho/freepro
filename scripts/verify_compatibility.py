@@ -91,7 +91,8 @@ def run(binary):
 
     with tempfile.TemporaryDirectory(prefix="freepro-test-") as tmp:
         root = Path(tmp)
-        (root / "freepro").mkdir()
+        config_dir = root / ("Library/Application Support/freepro" if sys.platform == "darwin" else "freepro")
+        config_dir.mkdir(parents=True)
         providers = []
         for prefix, wire in [("chat/", "chat_completions"), ("resp/", "openai_responses")]:
             providers.append({"display_name": prefix, "base_url": f"http://127.0.0.1:{upstream.server_port}/v1",
@@ -99,8 +100,8 @@ def run(binary):
                               "keys": [{"key": "test-only", "enabled": True}],
                               "headers": [{"key": "User-Agent", "value": "compat-test/1.0"},
                                           {"key": "X-Custom", "value": "preserved"}]})
-        (root / "freepro/freepro_config.json").write_text(json.dumps({"port": port, "providers": providers}), encoding="utf-8")
-        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, FREEPRO_NO_BROWSER="1")
+        (config_dir / "freepro_config.json").write_text(json.dumps({"port": port, "providers": providers}), encoding="utf-8")
+        env = dict(os.environ, APPDATA=tmp, XDG_CONFIG_HOME=tmp, HOME=tmp, USERPROFILE=tmp, FREEPRO_NO_BROWSER="1")
         with (root / "server.log").open("w") as log:
             process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=log, stderr=log,
                                        env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -173,7 +174,7 @@ def run(binary):
                 assert sum(m["output"] for m in usage["models"]) == usage["total_out"]
                 assert any(m["model"] == "chat/thinking" and m["days"] for m in usage["models"])
                 process.communicate(b"quit\n", timeout=20)
-                saved = json.loads((root / "freepro/freepro_config.json").read_text(encoding="utf-8"))
+                saved = json.loads((config_dir / "freepro_config.json").read_text(encoding="utf-8"))
                 assert saved["usage_models"] and saved["usage_in"] == usage["total_in"]
                 process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=log, stderr=log,
                                            env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -197,4 +198,4 @@ def run(binary):
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1] if len(sys.argv) > 1 else "zig-out/bin/freepro-gui.exe").resolve())
+    run(Path(sys.argv[1] if len(sys.argv) > 1 else ("zig-out/bin/freepro-gui.exe" if os.name == "nt" else "zig-out/bin/freepro-gui")).resolve())

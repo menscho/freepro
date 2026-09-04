@@ -22,6 +22,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe -j2
       - name: Unit tests
         run: zig build test -j2
+      - name: Proxy integration and persistence
+        run: python scripts/verify_compatibility.py
       - name: Executable smoke test
         shell: bash
         run: ./zig-out/bin/freepro-gui --version
