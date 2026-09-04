@@ -8,6 +8,7 @@ binary=Path('.verify/design-build/bin/freepro-gui.exe').resolve()
 with tempfile.TemporaryDirectory(prefix='freepro-update-') as tmp:
  root=Path(tmp);target=root/'freepro.exe';stage=root/'freepro.exe.update-test.exe';marker=root/'freepro.exe.update-test.exe.ready'
  shutil.copyfile(binary,stage);target.write_bytes(b'old executable fixture')
+ Path(str(target)+'.previous').write_bytes(b'older backup')
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
  (root/'freepro').mkdir();config=root/'freepro/freepro_config.json'
  fixture=dict(port=port,usage_in=1234,usage_out=567,providers=[dict(display_name='Fixture',base_url='http://127.0.0.1:9/v1',prefix='fixture/',description='test',keys=[dict(key='only-a-test-key',enabled=True)],headers=[])])
