@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>freepro · Model gateway</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<div id="app">
+  <nav id="rail" aria-label="Primary">
+    <a class="rail-brand" href="/" aria-label="freepro dashboard">
+      <svg width="20" height="20" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="2" width="8" height="8" rx="2"/><rect x="12" y="2" width="8" height="8" rx="2"/><rect x="2" y="12" width="8" height="8" rx="2"/><rect x="12" y="12" width="8" height="8" rx="2"/></svg><span>freepro<span class="brand-dot">.</span></span>
+    </a>
+    <div class="nav-caption">WORKSPACE</div><div class="rail-nav">
+      <button type="button" class="rail-btn is-active" data-view-link="dashboard" title="Dashboard" aria-label="Dashboard" aria-selected="true">
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg><span>Overview</span>
+      </button>
+      <button type="button" class="rail-btn" data-view-link="providers" title="Providers" aria-label="Providers" aria-selected="false">
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 5.5V2.5M4 2.5h4M6 5.5v2M3.5 9.5a2.5 2.5 0 0 1 5 0v1h3v3h-3v1a2.5 2.5 0 0 1-5 0v-5z"/></svg><span>Providers</span>
+      </button>
+      <button type="button" class="rail-btn" data-view-link="models" title="Models" aria-label="Models" aria-selected="false">
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1.5l6 3v7l-6 3-6-3v-7l6-3z"/><path d="M2 4.5l6 3 6-3M8 7.5v6"/></svg><span>Model library</span>
+      </button>
+      <button type="button" class="rail-btn" data-view-link="quick-adds" title="Quick adds" aria-label="Quick adds" aria-selected="false">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.5" y="2.5" width="15" height="15" rx="4"/><path d="M10 6v8M6 10h8"/></svg><span>Quick adds</span>
+      </button>
+      <button type="button" class="rail-btn" data-view-link="settings" title="Settings" aria-label="Settings" aria-selected="false">
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"/></svg><span>Settings</span>
+      </button>
+    </div>
+    <div class="update-area" id="update-area" hidden><button type="button" class="btn" id="app-update" title="Update freepro"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M10 2v11m-4-4 4 4 4-4M3 13v4h14v-4"/></svg><span id="update-label">Update</span></button><small id="update-version"></small></div>
+  </nav>
+  <div id="content">
+    <header id="topbar">
+      <span class="breadcrumb">freepro <span>/</span></span><h1 id="view-title" data-bind="view-title">Overview</h1>
+      <button type="button" class="btn outline" id="proxy-toggle" data-action="proxy-toggle" aria-pressed="false">Start</button>
+      <button type="button" class="btn ghost" id="copy-url" data-action="copy-url" title="Copy base URL">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4.5" y="4.5" width="8" height="8" rx="1.5"/><path d="M9.5 4.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>
+        <span>Copy URL</span>
+      </button>
+    </header>
+    <main id="main" tabindex="-1">
+      <section id="view-dashboard" data-view="dashboard" aria-label="Dashboard">
+        <div class="page-heading"><div><h2>Overview</h2><p id="overview-date">Usage and performance</p></div><span class="live-label"><i></i> Live</span></div>
+        <div class="metrics">
+          <div class="card metric"><span class="metric-icon violet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></svg></span><h3>Tokens today</h3><p data-bind="metric-tokens">0</p><small id="tokens-today-detail">Input + output · UTC</small></div>
+          <div class="card metric"><span class="metric-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></span><h3>Requests</h3><p data-bind="metric-served">0</p><small><span data-bind="metric-inflight">0</span> in flight · this session</small></div>
+          <div class="card metric"><span class="metric-icon amber"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 2h6"/></svg></span><h3>Average latency</h3><p data-bind="metric-latency">—</p><small>Completed requests</small></div>
+          <div class="card metric"><span class="metric-icon green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="9" r="5"/><path d="m12 13 8 8m-5-5 3-3m-1 5 3-3"/></svg></span><h3>Healthy keys</h3><p><span data-bind="metric-healthy">0</span><span class="metric-denominator"> / <span data-bind="metric-keys">0</span></span></p><small><span data-bind="metric-providers">0</span> providers connected</small></div>
+        </div>
+        <section class="card usage-panel" aria-labelledby="usage-title">
+          <div class="usage-header"><div><h2 id="usage-title">Token usage</h2><span class="muted" id="usage-period-label">Last 7 days · UTC</span></div><div class="usage-filters"><label class="sr-only" for="usage-model">Model</label><select id="usage-model"><option value="">All models</option></select><label class="sr-only" for="usage-range">Date range</label><select id="usage-range"><option value="1">Today</option><option value="7" selected>Last 7 days</option><option value="30">Last 30 days</option><option value="all">All time</option></select></div></div>
+          <div class="usage-nav"><div class="segmented" role="group" aria-label="Usage view"><button class="is-active" data-usage-view="timeline" aria-pressed="true">Timeline</button><button data-usage-view="models" aria-pressed="false">By model</button><button data-usage-view="days" aria-pressed="false">Daily log</button></div><button class="btn ghost small" id="usage-export" type="button">Export CSV <span aria-hidden="true">↓</span></button></div>
+          <div class="usage-totals"><div><span>Total tokens</span><strong id="usage-total">0</strong></div><div><span><i class="dot blue"></i>Input</span><strong data-bind="usage-in">0</strong></div><div><span><i class="dot violet"></i>Output</span><strong data-bind="usage-out">0</strong></div><div><span><i class="dot green"></i>Cached input</span><strong data-bind="usage-cached">0</strong></div><div><span>Requests</span><strong id="usage-requests">0</strong></div></div>
+          <div id="usage-timeline" class="usage-visuals"><div class="usage-plot"><div class="plot-caption"><span>Daily volume</span><span>Input + output</span></div><div class="canvas-wrap"><canvas id="usage-chart" role="img" aria-label="Daily token usage"></canvas><div id="usage-tooltip" class="chart-tooltip" hidden></div></div></div><div class="distribution"><div class="plot-caption">Token share by model</div><div id="model-donut" class="donut" role="img" aria-label="Model token distribution"><div><strong id="usage-model-count">0</strong><span>models</span></div></div><div id="model-legend" class="model-legend"></div></div></div>
+          <div id="usage-models" class="usage-table-wrap" hidden><table class="data-table"><thead><tr><th>Model</th><th>Share</th><th>Input</th><th>Output</th><th>Cached</th><th>Requests</th><th>Total tokens</th></tr></thead><tbody id="usage-model-rows"></tbody></table></div>
+          <div id="usage-days" class="usage-table-wrap" hidden><table class="data-table"><thead><tr><th>Date · UTC</th><th>Input</th><th>Output</th><th>Cached</th><th>Requests</th><th>Total tokens</th></tr></thead><tbody id="usage-day-rows"></tbody></table></div>
+          <div class="usage-foot"><span id="usage-history-note">Model tracking starts with this update.</span><span>Cached tokens are included in input.</span></div>
+        </section>
+        <div class="analytics-grid"><div class="card chart-card"><div class="card-head"><h2>Request activity</h2><span class="live-label"><i></i> Live</span></div><div class="chart-value"><span id="request-rate">0.0</span><small> req / sec</small></div><canvas id="spark" width="900" height="170" data-bind="spark" aria-label="Request rate" role="img"></canvas><div class="chart-foot"><span>Recent samples</span><span>Now</span></div></div><div class="card activity-card"><div class="card-head"><h2>Recent activity</h2><button type="button" class="btn ghost small" data-action="refresh-activity" aria-label="Refresh recent activity">Refresh ↻</button></div><ol id="activity-list" class="activity" data-bind="activity"></ol></div></div>
+      </section>
+      <section id="view-providers" data-view="providers" aria-label="Providers" hidden>
+        <p class="section-description">Providers and API keys.</p><div class="toolbar">
+          <div class="field search">
+            <label for="provider-search">Search</label>
+            <div class="search-wrap">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="6" cy="6" r="4"/><path d="M9.2 9.2L12.5 12.5"/></svg>
+              <input id="provider-search" type="search" placeholder="Filter providers" data-filter="providers" autocomplete="off">
+            </div>
+          </div>
+          <button type="button" class="btn outline" id="provider-add" data-action="provider-add">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M7 2.5v9M2.5 7h9"/></svg>
+            <span>Add provider</span>
+          </button>
+        </div>
+        <div class="provider-grid" id="provider-grid" data-bind="provider-grid"></div>
+        <details class="card" id="bulk-import">
+          <summary>Bulk import</summary>
+          <div class="field">
+            <label for="bulk-textarea">Paste keys, one per line</label>
+            <textarea id="bulk-textarea" rows="4" spellcheck="false" data-bind="bulk-text" placeholder="provider | key per line"></textarea>
+          </div>
+          <button type="button" class="btn ghost" data-action="bulk-import">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 7h9M7 2.5v9"/></svg>
+            <span>Import</span>
+          </button>
+        </details>
+      </section>
+      <section id="view-models" data-view="models" aria-label="Models" hidden>
+        <p class="section-description">Select the models available to your clients.</p><div class="toolbar">
+          <div class="field search">
+            <label for="models-search">Filter</label>
+            <div class="search-wrap">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="6" cy="6" r="4"/><path d="M9.2 9.2L12.5 12.5"/></svg>
+              <input id="models-search" type="search" placeholder="Filter models" data-filter="models" autocomplete="off">
+            </div>
+          </div>
+          <div class="filter-group" role="group" aria-label="Filter">
+            <button type="button" class="btn small is-active" data-filter-status="all" aria-pressed="true">All</button>
+            <button type="button" class="btn small" data-filter-status="on" aria-pressed="false">On</button>
+            <button type="button" class="btn small" data-filter-status="off" aria-pressed="false">Off</button>
+            <button type="button" class="btn small" data-filter-status="free" aria-pressed="false">Free</button>
+          </div>
+          <label class="switch-label" for="hide-paid-toggle">
+            <input type="checkbox" class="toggle" id="hide-paid-toggle" data-bind="hide-paid" aria-label="Hide paid models">
+            <span>Hide paid models</span>
+          </label>
+          <button type="button" class="btn small" id="models-all-on" data-action="models-all-on">All on</button>
+          <button type="button" class="btn small" id="models-all-off" data-action="models-all-off">All off</button>
+          <button type="button" class="btn outline" id="models-reload" data-action="models-reload">Refresh</button>
+        </div>
+        <div class="card table-card">
+          <table id="models-table">
+            <thead><tr>
+              <th scope="col" class="col-check"><span class="sr-only">Enabled</span></th>
+              <th scope="col">Model</th>
+              <th scope="col">Provider</th>
+              <th scope="col">Reasoning</th>
+              <th scope="col">Context</th>
+            </tr></thead>
+            <tbody id="models-body" data-bind="models-body"></tbody>
+          </table>
+          <p class="count mono" id="models-count" data-bind="models-count">0 models</p>
+        </div>
+      </section>
+      <section id="view-quick-adds" data-view="quick-adds" aria-label="Quick adds" hidden>
+        <div class="page-heading"><div><h2>Quick adds</h2><p>Connect your coding tools to freepro.</p></div></div>
+        <article class="quick-add-card">
+          <div class="quick-add-heading"><img src="/kimi-logo.png" width="52" height="52" alt="Kimi Code logo"><div><h3>Kimi Code</h3><p>Your enabled models, ready to use.</p></div></div>
+          <div class="quick-add-config"><span>CONFIGURATION</span><code id="kimi-config-path">Loading config location…</code></div>
+          <p class="quick-add-note">Adds or updates the freepro provider and models. Your selected model and other settings stay in place.</p>
+          <div class="quick-add-actions"><button type="button" class="btn outline" id="kimi-add-update" disabled>Add/Update</button><span>Then run <code>/reload</code> in Kimi Code.</span></div>
+          <p id="kimi-add-status" class="quick-add-status" role="status" aria-live="polite" hidden></p>
+        </article>
+      </section>
+      <section id="view-settings" data-view="settings" aria-label="Settings" hidden>
+        <div class="card settings-card">
+          <div class="card-head"><h2>Server</h2></div>
+          <form id="settings-form" data-bind="settings-form" novalidate>
+            <div class="form-grid">
+              <div class="field">
+                <label for="set-port">Port</label>
+                <input class="mono" id="set-port" type="number" min="1" max="65535" step="1" value="8080" data-bind="settings-port" inputmode="numeric">
+              </div>
+              <div class="field check">
+                <input type="checkbox" id="set-autostart" data-bind="settings-autostart">
+                <label for="set-autostart">Autostart proxy</label>
+              </div>
+              <div class="field">
+                <label for="set-cooldown">Key cooldown (seconds)</label>
+                <input class="mono" id="set-cooldown" type="number" min="0" step="1" value="30" data-bind="settings-cooldown" inputmode="numeric">
+              </div>
+              <div class="field">
+                <label for="set-timeout">Request timeout (seconds)</label>
+                <input class="mono" id="set-timeout" type="number" min="1" step="1" value="60" data-bind="settings-timeout" inputmode="numeric">
+              </div>
+            </div>
+            <p class="dirty-note" id="settings-dirty" data-bind="settings-dirty" hidden>Unsaved changes</p>
+            <button type="submit" class="btn outline" data-action="settings-save">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 7.5l3 3 6-7"/></svg>
+              <span>Save</span>
+            </button>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-root"></div>
+<template id="tpl-provider-card">
+  <article class="card provider-card" data-bind="provider-card">
+    <div class="card-head">
+      <span class="prov-logo" data-bind="provider-logo" aria-hidden="true">O</span>
+      <input class="provider-name-input" data-bind="provider-name" value="Name" aria-label="Display name" autocomplete="off" spellcheck="false">
+      <span class="pill mono" data-bind="provider-prefix">oc/</span>
+      <span class="pill" data-bind="provider-health-text">n/a</span>
+    </div>
+    <p class="provider-url muted truncate mono" data-bind="provider-url"></p>
+    <p class="provider-note muted" data-bind="provider-note"></p>
+    <p class="provider-site"><a data-bind="provider-site-link" target="_blank" rel="noopener">Website</a></p>
+    <div class="health" aria-hidden="true"><span data-bind="provider-health-bar"></span></div>
+    <div class="field">
+      <label>Keys</label>
+      <ul class="key-list" data-bind="provider-keys"></ul>
+      <div class="field row key-add">
+        <label class="sr-only" for="key-add-dummy">Add key</label>
+        <input type="password" data-bind="provider-key-input" id="key-add-dummy" placeholder="Paste API key" autocomplete="off" spellcheck="false">
+        <button type="button" class="btn small" data-action="provider-key-add" title="Add key">Add</button>
+      </div>
+    </div>
+    <label class="switch-label prov-proxy">
+      <input type="checkbox" class="toggle" data-bind="provider-proxy-toggle" aria-label="Route through free proxies">
+      <span>Public proxy routing</span>
+      <span class="pill pill-warn">Shared IPs</span>
+    </label>
+    <details class="prov-details">
+      <summary>Headers <span class="pill mono" data-bind="header-count">0</span></summary>
+      <table class="headers-table">
+        <thead><tr><th scope="col">Name</th><th scope="col">Value</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody data-bind="headers-body"></tbody>
+      </table>
+      <div class="field row">
+        <label class="sr-only" for="header-name-dummy">Header name</label>
+        <input type="text" data-bind="header-name-input" id="header-name-dummy" placeholder="Name" autocomplete="off" spellcheck="false">
+        <label class="sr-only" for="header-value-dummy">Header value</label>
+        <input type="text" data-bind="header-value-input" id="header-value-dummy" placeholder="Value" autocomplete="off" spellcheck="false">
+        <button type="button" class="btn small" data-action="header-add" title="Add header">Add</button>
+      </div>
+    </details>
+    <div class="card-actions">
+      <span class="muted small-note" data-bind="provider-models-note"></span>
+      <button type="button" class="btn small danger" data-action="provider-remove" title="Remove provider">
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8"/></svg>
+        <span>Remove</span>
+      </button>
+    </div>
+  </article>
+</template>
+<template id="tpl-key-row">
+  <li class="key-row">
+    <span class="mono" data-bind="key-mask">abc...z1</span>
+    <span class="badge badge-connected" data-bind="key-state">Healthy</span>
+    <span class="key-actions">
+      <button type="button" class="btn small" data-action="key-ping" title="Test key against upstream">Ping</button>
+      <button type="button" class="btn small" data-action="key-toggle" title="Enable or disable">On</button>
+      <button type="button" class="btn small" data-action="key-copy" title="Copy key id">
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4.5" y="4.5" width="8" height="8" rx="1.5"/><path d="M9.5 4.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>
+        <span class="sr-only">Copy key id</span>
+      </button>
+      <button type="button" class="btn small danger" data-action="key-remove" title="Delete key">
+        <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8"/></svg>
+        <span class="sr-only">Remove key</span>
+      </button>
+    </span>
+  </li>
+</template>
+<template id="tpl-toast">
+  <div class="toast" data-bind="toast">
+    <span class="toast-text" data-bind="toast-text">Done</span>
+    <button type="button" class="btn small" data-action="toast-dismiss" aria-label="Dismiss">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3l8 8M11 3l-8 8"/></svg>
+    </button>
+  </div>
+</template>
+<template id="tpl-modal">
+  <div class="modal-backdrop" data-bind="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title" data-bind="modal-title">Confirm</h2>
+      <p data-bind="modal-body">Are you sure</p>
+      <div class="modal-actions">
+        <button type="button" class="btn" data-action="modal-cancel">Cancel</button>
+        <button type="button" class="btn danger" data-action="modal-confirm">Delete</button>
+      </div>
+    </div>
+  </div>
+</template>
+</body>
+</html>

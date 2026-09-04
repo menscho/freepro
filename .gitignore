@@ -1,0 +1,15 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+.tmp-zig/
+.verify/
+release/
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.bak
+freepro_config.json
+.env
+.env.*
