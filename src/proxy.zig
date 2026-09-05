@@ -3047,7 +3047,7 @@ test "static headers ride on upstream requests" {
 
     var keys = [_]models.Key{.{ .key = "TESTKEY" }};
     var hdrs = [_]models.CustomHeader{
-        .{ .key = "User-Agent", .value = "opencode/1.18.26" },
+        .{ .key = "User-Agent", .value = "opencode/1.18.29" },
         .{ .key = "x-opencode-project", .value = "global" },
         .{ .key = "x-opencode-client", .value = "cli" },
     };
@@ -3074,7 +3074,7 @@ test "static headers ride on upstream requests" {
     defer alloc.free(resp);
     try std.testing.expectEqual(@as(u16, 200), try responseStatus(resp));
 
-    try std.testing.expectEqualStrings("opencode/1.18.26", H.find("User-Agent").?);
+    try std.testing.expectEqualStrings("opencode/1.18.29", H.find("User-Agent").?);
     try std.testing.expectEqualStrings("global", H.find("x-opencode-project").?);
     try std.testing.expectEqualStrings("cli", H.find("x-opencode-client").?);
     try std.testing.expectEqualStrings("Bearer TESTKEY", H.find("authorization").?);

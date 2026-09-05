@@ -768,7 +768,7 @@ pub fn statusSuggestsDead(status: u16) bool {
 /// The five mandatory static headers for the OpenCode Zen preset.
 pub fn defaultOpenCodeHeaders(allocator: Allocator) ![]CustomHeader {
     const preset = [_]CustomHeader{
-        .{ .key = "User-Agent", .value = "opencode/1.18.26" },
+        .{ .key = "User-Agent", .value = "opencode/1.18.29" },
         .{ .key = "x-opencode-project", .value = "global" },
         .{ .key = "x-opencode-session", .value = "ses_19f6c1805ffe2ziZ0G3WZCdgAW" },
         .{ .key = "x-opencode-request", .value = "msg_8c4e2a91b7d03f5e" },
@@ -976,7 +976,7 @@ test "presets carry the plan.md base urls, prefixes and static headers" {
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1/", oc.base_url);
     try std.testing.expectEqualStrings("oc/", oc.prefix);
     try std.testing.expectEqual(@as(usize, 5), oc.headers.len);
-    try std.testing.expectEqualStrings("opencode/1.18.26", oc.findHeader("User-Agent").?);
+    try std.testing.expectEqualStrings("opencode/1.18.29", oc.findHeader("User-Agent").?);
     try std.testing.expectEqualStrings("global", oc.findHeader("x-opencode-project").?);
     try std.testing.expectEqualStrings("ses_19f6c1805ffe2ziZ0G3WZCdgAW", oc.findHeader("x-opencode-session").?);
     try std.testing.expectEqualStrings("msg_8c4e2a91b7d03f5e", oc.findHeader("x-opencode-request").?);
@@ -1108,7 +1108,7 @@ test "json roundtrip preserves config including key state" {
     try std.testing.expectEqualStrings("oc-key-2", restored.providers[0].keys[1].key);
     try std.testing.expectEqual(KeyState.CoolingDown, restored.providers[0].keys[1].state);
     try std.testing.expectEqual(@as(i64, 9_999), restored.providers[0].keys[1].cooldown_until);
-    try std.testing.expectEqualStrings("opencode/1.18.26", restored.providers[0].findHeader("User-Agent").?);
+    try std.testing.expectEqualStrings("opencode/1.18.29", restored.providers[0].findHeader("User-Agent").?);
 }
 
 test "model routing matches prefixes and strips them" {

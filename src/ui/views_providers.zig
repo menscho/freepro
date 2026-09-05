@@ -622,7 +622,7 @@ test "providers bulk add, row actions, and headers against real models" {
     // OpenCode prefill is idempotent.
     try t.expectEqual(@as(usize, 5), try ensureOpenCodeHeaders(t.allocator, &provider));
     try t.expectEqual(@as(usize, 0), try ensureOpenCodeHeaders(t.allocator, &provider));
-    try t.expectEqualStrings("opencode/1.18.26", provider.findHeader("User-Agent").?);
+    try t.expectEqualStrings("opencode/1.18.29", provider.findHeader("User-Agent").?);
     try provider.validate();
 }
 

@@ -156,7 +156,7 @@ fn mkdirPAbsolute(io: Io, abs_dir: []const u8) !void {
 }
 
 const opencode_headers: []const [2][]const u8 = &.{
-    .{ "User-Agent", "opencode/1.18.26" },
+    .{ "User-Agent", "opencode/1.18.29" },
     .{ "x-opencode-project", "global" },
     .{ "x-opencode-session", "ses_19f6c1805ffe2ziZ0G3WZCdgAW" },
     .{ "x-opencode-request", "msg_8c4e2a91b7d03f5e" },
@@ -405,7 +405,7 @@ test "defaults ship the OpenCode and Kilo presets" {
     try std.testing.expectEqual(@as(usize, 0), oc.keys.len);
     try std.testing.expectEqual(@as(usize, 5), oc.headers.len);
     try std.testing.expectEqualStrings("User-Agent", oc.headers[0].key);
-    try std.testing.expectEqualStrings("opencode/1.18.26", oc.headers[0].value);
+    try std.testing.expectEqualStrings("opencode/1.18.29", oc.headers[0].value);
     try std.testing.expectEqualStrings("x-opencode-project", oc.headers[1].key);
     try std.testing.expectEqualStrings("global", oc.headers[1].value);
     try std.testing.expectEqualStrings("x-opencode-client", oc.headers[4].key);
@@ -475,7 +475,7 @@ test "save/load round-trips edited settings and keys" {
     try std.testing.expectEqual(models.KeyState.Active, loaded.providers[0].keys[0].state);
     try std.testing.expectEqual(true, loaded.providers[0].keys[0].enabled);
     try std.testing.expectEqual(@as(usize, 5), loaded.providers[0].headers.len);
-    try std.testing.expectEqualStrings("opencode/1.18.26", loaded.providers[0].headers[0].value);
+    try std.testing.expectEqualStrings("opencode/1.18.29", loaded.providers[0].headers[0].value);
 }
 
 test "loading a missing file yields defaults" {
