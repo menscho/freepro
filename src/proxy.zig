@@ -1816,6 +1816,23 @@ fn forwardAttempt(
     ctx.phase = "response body";
     if (models.isHealthyStatus(status)) {
         if (upstream_sse and !responses_mode) {
+            // The upstream has confirmed 200 + text/event-stream. Send the
+            // SSE response head to the client IMMEDIATELY, before waiting for
+            // the first body byte: a model that takes many seconds to start
+            // streaming would otherwise leave the client hanging with no
+            // response until its idle timeout fires (499).
+            ctx.committed = true;
+            sendSseHead(writer) catch {
+                if (proxied) |*pr| pr.ok = null;
+                return error.ClientDisconnected;
+            };
+            // Flush the head NOW so the client sees HTTP 200 before the first
+            // body byte (a slow-to-start model would otherwise leave the
+            // client hanging until its idle timeout -> 499).
+            writer.flush() catch {
+                if (proxied) |*pr| pr.ok = null;
+                return error.ClientDisconnected;
+            };
             var chunk: [32768]u8 = undefined;
             var started = false;
             var marker_line: [64]u8 = undefined;
@@ -1840,14 +1857,7 @@ fn forwardAttempt(
                         marker_len += 1;
                     } else marker_overflow = true;
                 }
-                if (!started) {
-                    ctx.committed = true;
-                    sendSseHead(writer) catch {
-                        if (proxied) |*pr| pr.ok = null;
-                        return error.ClientDisconnected;
-                    };
-                    started = true;
-                }
+                if (!started) started = true;
                 if (acc) |a| a.scanSse(chunk[0..n]);
                 sendSseChunk(writer, chunk[0..n]) catch {
                     if (proxied) |*pr| pr.ok = null;
