@@ -461,9 +461,13 @@ pub const Pool = struct {
         if (picked.leased) e.in_flight = false;
         const healthy = ok orelse return; // A client disconnect says nothing about the route.
         if (healthy) {
-            // proxy_pool score recovery: success improves the score.
+            // proxy_pool score recovery: success improves the score. A real
+            // 2xx through the route is as good as a neutral probe, so it also
+            // refreshes validation freshness - a working route stays in
+            // rotation instead of being aged out and re-probed.
             e.fails = if (e.fails > 0) e.fails - 1 else 0;
             e.last_ok_ms = self.now();
+            e.validated_ms = self.now();
             e.uses +|= 1;
             if (e.latency_ms == 0) e.latency_ms = latency_ms;
         } else {
@@ -1119,6 +1123,22 @@ test "fast successful routes are reused and model generation time is not probe l
     defer a.free(again.host);
     try std.testing.expectEqual(fast.port, again.port);
     pool.report(again, 0, null);
+}
+
+test "a real success refreshes validation freshness so working routes stay in rotation" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    // A route whose last validation is older than 2x the refresh interval is
+    // normally unpickable; a real 2xx through it refreshes validated_ms.
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 7, .validated_ms = pool.now() - 3 * validation_refresh_ms });
+    try std.testing.expect(pool.pick(a) == null); // aged out
+    pool.entries.items[0].validated_ms = pool.now();
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 10, true); // success refreshes
+    try std.testing.expect(pool.entries.items[0].validated_ms >= pool.now() - 1);
 }
 
 test "routeStatus cools but never deletes; only repeated transport fails drop" {

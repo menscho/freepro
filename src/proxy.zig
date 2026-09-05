@@ -1725,7 +1725,14 @@ fn forwardAttempt(
             if (pool.originThrottleOpen(prov.prefix)) return error.OriginThrottled;
             pool.noteDemand();
             ctx.phase = "waiting for public proxy";
-            picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 30000));
+            // Cap a single wait short (3s): a proxy wait must not hold a
+            // worker hostage for the full request deadline. When the pool is
+            // empty, many concurrent requests would otherwise occupy every
+            // worker for up to 30s and backpressure the accept loop, stalling
+            // ALL traffic (including non-proxy and dashboard). Attempts retry
+            // within the shared deadline, so a short per-attempt wait is fine.
+            const wait_budget = try ctx.remaining(self.io, @min(3000, self.config.timeout_ms));
+            picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, wait_budget);
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
         }
     }
