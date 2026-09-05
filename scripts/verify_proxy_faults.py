@@ -70,9 +70,11 @@ class Hop:
   finally:c.close()
  def close(self):self.stop.set();self.server.close()
 def run(modes,timeout=1600,stream=False,large=False,disconnect=False,pretrip=False):
- hops=[Hop(m) for m in modes]
+ # macOS does not configure the whole 127/8 range; use localhost there.
+ hosts=[('localhost' if i else '127.0.0.1') if sys.platform=='darwin' else f'127.0.0.{i+1}' for i in range(len(modes))]
+ hops=[Hop(m, '127.0.0.1' if sys.platform=='darwin' else hosts[i]) for i,m in enumerate(modes)]
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
- env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join('localhost' if i else '127.0.0.1' for i in range(len(hops))),TEST_TIMEOUT=str(timeout),TEST_PRETRIP="1" if pretrip else "0")
+ env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join(hosts),TEST_TIMEOUT=str(timeout),TEST_PRETRIP="1" if pretrip else "0")
  proc=subprocess.Popen([str(binary)],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  try:
   for _ in range(80):

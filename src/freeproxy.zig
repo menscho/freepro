@@ -384,6 +384,22 @@ pub const Pool = struct {
             }
         }
         const idx = best orelse return null;
+        if (!self.entries.items[idx].preferred) {
+            var unproven_in_flight: usize = 0;
+            var proven_available = false;
+            const at = self.now();
+            for (self.entries.items) |e| {
+                if (e.in_flight and !e.preferred) unproven_in_flight += 1;
+                if (e.preferred and e.fails < max_fails and e.blocked_until_ms <= at and
+                    !self.quarantined(e.host, e.port) and
+                    (e.validated_ms == 0 or at - e.validated_ms <= 2 * validation_refresh_ms)) proven_available = true;
+            }
+            // A burst should reuse proven completions while only a small number
+            // of requests trial unknown routes. Do not multiply cold-route errors
+            // by the number of agents. Successful trials grow proven capacity.
+            const trial_limit: usize = @min(8, @as(usize, if (proven_available) 1 else 2) + self.waiting / 16);
+            if (unproven_in_flight >= trial_limit) return null;
+        }
         self.clock += 1;
         self.entries.items[idx].last_used = self.clock;
         const e = &self.entries.items[idx];
@@ -585,11 +601,13 @@ pub const Pool = struct {
     // -- diagnostics ----------------------------------------------------------
 
     /// Diagnostics: tracked entries and whether a refresh pass is running.
-    pub fn diag(self: *Pool) struct { tracked: usize, working: bool, lists_ms: i64, validated_ms: i64, last_error: []const u8, ready: usize, busy: usize, blocked: usize, waiting: usize, candidates: usize } {
+    pub fn diag(self: *Pool) struct { tracked: usize, working: bool, lists_ms: i64, validated_ms: i64, last_error: []const u8, ready: usize, busy: usize, blocked: usize, waiting: usize, candidates: usize, proven_ready: usize, proven_busy: usize } {
         self.mu.lock();
         defer self.mu.unlock();
         return .{
             .ready = self.readyCount(),
+            .proven_ready = self.provenCount(false),
+            .proven_busy = self.provenCount(true),
             .busy = blk: {
                 var n: usize = 0;
                 for (self.entries.items) |e| {
@@ -612,6 +630,17 @@ pub const Pool = struct {
             .validated_ms = self.pool_validated_ms,
             .last_error = self.last_refresh_error,
         };
+    }
+
+    fn provenCount(self: *Pool, busy: bool) usize {
+        const at = self.now();
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.preferred and e.in_flight == busy and e.fails < max_fails and
+                e.blocked_until_ms <= at and !self.quarantined(e.host, e.port) and
+                (e.validated_ms == 0 or at - e.validated_ms <= 2 * validation_refresh_ms)) n += 1;
+        }
+        return n;
     }
 
     /// How many alive proxies are currently pooled.
@@ -1593,4 +1622,46 @@ test "throttle breaker does not block a fresh or busy eligible route" {
     pool.routeStatus(held, 429);
     pool.report(held, 0, null);
     try std.testing.expect(pool.originThrottleBlocks("oc/"));
+}
+
+test "cold-route trials are bounded and a proven route is reused" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    for (0..4) |i| try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = @intCast(8000 + i) });
+    const first = pool.pick(a).?;
+    defer a.free(first.host);
+    const second = pool.pick(a).?;
+    defer a.free(second.host);
+    try std.testing.expect(pool.pick(a) == null);
+    pool.routeStatus(first, 200);
+    pool.report(first, 10, true);
+    const reused = pool.pick(a).?;
+    defer a.free(reused.host);
+    try std.testing.expectEqual(first.port, reused.port);
+    try std.testing.expect(pool.pick(a) == null);
+    pool.report(second, 0, null);
+    const trial = pool.pick(a).?;
+    defer a.free(trial.host);
+    try std.testing.expect(!pool.entries.items[trial.index].preferred);
+    pool.report(trial, 0, null);
+    pool.report(reused, 0, null);
+}
+
+test "large queues grow cold-route trials within a fixed cap" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    for (0..12) |i| try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = @intCast(9000 + i) });
+    pool.waiting = 100;
+    var held: [8]Picked = undefined;
+    for (&held) |*r| r.* = pool.pickLocked(a, &.{}).?;
+    try std.testing.expect(pool.pickLocked(a, &.{}) == null);
+    for (held) |r| {
+        pool.report(r, 0, null);
+        a.free(r.host);
+    }
+    pool.waiting = 0;
 }

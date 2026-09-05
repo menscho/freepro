@@ -64,9 +64,9 @@ proc,hops,port=start(['slow-ok','slow-ok'],40000)
 try:
  start_time=time.monotonic()
  for wave in range(6):
-  with ThreadPoolExecutor(max_workers=64) as workers:list(workers.map(lambda _:chat(port),range(256)))
+  with ThreadPoolExecutor(max_workers=100) as workers:list(workers.map(lambda _:chat(port),range(256)))
   state=get(port)
   assert state['busy']==0 and state['waiting']==0 and state['ready']==2,state
-  print(f'PASS sustained wave {wave+1}/6: 256 requests, 64 agents, zero 503s; no leaked leases or waiters',flush=True)
+  print(f'PASS sustained wave {wave+1}/6: 256 requests, 100 agents, zero 503s; no leaked leases or waiters',flush=True)
  print(f'PASS 1536 requests over {time.monotonic()-start_time:.1f}s on one server, with the production key rotator',flush=True)
 finally:stop(proc,hops)
