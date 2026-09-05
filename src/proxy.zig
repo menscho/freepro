@@ -2591,7 +2591,8 @@ fn testPort(base: u16) u16 {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.c.getpid()),
     };
-    return base + @as(u16, @intCast(pid % 2000));
+    // Adjacent test processes must not overlap their 13-port ranges.
+    return 10_000 + @as(u16, @intCast(pid % 1500)) * 32 + (base - 18080);
 }
 
 fn testClientRequest(alloc: Allocator, port: u16, request: []const u8) ![]u8 {

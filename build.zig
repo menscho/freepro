@@ -64,12 +64,13 @@ pub fn build(b: *std.Build) void {
     gui_step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run unit tests for every internal module");
+    var previous_test: ?*std.Build.Step = null;
     for (module_names) |name| {
         if (std.mem.eql(u8, name, "netwin") and target.result.os.tag != .windows) continue;
-        addUnitTest(b, test_step, b.fmt("src/{s}.zig", .{name}), target, optimize);
+        previous_test = addUnitTest(b, test_step, b.fmt("src/{s}.zig", .{name}), target, optimize, previous_test);
     }
     for (extra_test_roots) |root| {
-        addUnitTest(b, test_step, root, target, optimize);
+        previous_test = addUnitTest(b, test_step, root, target, optimize, previous_test);
     }
 
     const release_all = b.step("release-all", "Cross-compile optimized binaries for all supported targets");
@@ -125,7 +126,8 @@ fn addUnitTest(
     root_source_file: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) void {
+    previous: ?*std.Build.Step,
+) *std.Build.Step {
     const test_mod = b.createModule(.{
         .root_source_file = b.path(root_source_file),
         .target = target,
@@ -146,5 +148,8 @@ fn addUnitTest(
     });
     if (target.result.os.tag == .windows) test_mod.linkSystemLibrary("ws2_32", .{});
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Compile independently, but keep socket-owning test executables isolated.
+    if (previous) |step| run_unit_tests.step.dependOn(step);
     test_step.dependOn(&run_unit_tests.step);
+    return &run_unit_tests.step;
 }
