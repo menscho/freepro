@@ -44,10 +44,10 @@
 //     config must not be mutated while the proxy is running; main.zig restarts
 //     the proxy (stop -> mutate -> start) on config changes. The rotator must
 //     be thread-safe; the standalone fallback picker is guarded by key_mu.
-//   * Upstream timeout: HttpClient exposes no per-request timeout knob,
-//     so `config.timeout_ms` is validated/stored by models.zig and honored
-//     for listener behavior; upstream stalls rely on OS TCP timeouts and are
-//     treated as transport failures (null status) that trigger failover.
+//   * Public-proxy requests share config.timeout_ms across connection,
+//     upload and buffered response retries. Live streams use that value as
+//     an idle-read timeout once downstream output has begun. Direct upstream
+//     transport failures retain the existing key-failover behavior.
 //   * Logger/Metrics hooks are type-erased facades (see below), NOT imports of
 //     logger.zig / metrics.zig: those modules are owned by sibling agents and
 //     were still on the 0.13 spelling when this file was ported, and importing
@@ -1500,6 +1500,23 @@ fn sendSyntheticChat(writer: *std.Io.Writer, alloc: Allocator, body: []const u8)
     try sendSseEnd(writer);
 }
 
+fn isSseDoneLine(line: []const u8) bool {
+    const text = std.mem.trim(u8, line, " \t\r");
+    return std.mem.startsWith(u8, text, "data:") and std.mem.eql(u8, std.mem.trim(u8, text[5..], " \t\r"), "[DONE]");
+}
+
+const AttemptContext = struct {
+    deadline_ms: i64,
+    committed: bool = false,
+    phase: []const u8 = "connect",
+    routes: std.ArrayList(freeproxy.Picked) = .empty,
+    fn remaining(self: *AttemptContext, io: std.Io, cap_ms: u64) !u64 {
+        const left = self.deadline_ms - std.Io.Clock.awake.now(io).toMilliseconds();
+        if (left <= 0) return error.Timeout;
+        return @min(@as(u64, @intCast(left)), cap_ms);
+    }
+};
+
 fn forwardAttempt(
     self: *Proxy,
     provider_idx: usize,
@@ -1510,6 +1527,7 @@ fn forwardAttempt(
     writer: *std.Io.Writer,
     alloc: Allocator,
     acc: ?*UsageAccum,
+    ctx: *AttemptContext,
 ) !AttemptOutcome {
     const prov = &self.config.providers[provider_idx];
     const key_material = prov.keys[key_idx].key;
@@ -1549,7 +1567,7 @@ fn forwardAttempt(
     if (self.free_proxies) |pool| {
         if (prov.use_free_proxy) {
             pool.maybeRefresh();
-            picked_proxy = pool.pick(alloc);
+            picked_proxy = pool.pickAvoiding(alloc, ctx.routes.items);
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
         }
     }
@@ -1560,14 +1578,15 @@ fn forwardAttempt(
         pool: *freeproxy.Pool,
         picked: freeproxy.Picked,
         t0_ms: i64,
-        ok: bool = false,
+        ok: ?bool = false,
     };
     var proxied: ?ProxiedOutcome = if (picked_proxy) |picked| .{
         .pool = self.free_proxies.?,
         .picked = picked,
         .t0_ms = nowMs(),
     } else null;
-    defer if (proxied) |pr| pr.pool.report(pr.picked, @intCast(@max(0, nowMs() - pr.t0_ms)), pr.ok);
+    defer if (proxied) |pr| pr.pool.report(pr.picked, @intCast(@min(std.math.maxInt(u32), @max(0, nowMs() - pr.t0_ms))), pr.ok);
+    if (picked_proxy) |picked| try ctx.routes.append(alloc, picked);
 
     var client: HttpClient = .{ .allocator = alloc, .io = self.io };
     defer client.deinit();
@@ -1599,8 +1618,9 @@ fn forwardAttempt(
         },
         .extra_headers = priv.extras,
     };
+    ctx.phase = "connect/TLS";
     var req = if (picked_proxy != null)
-        try freeproxy.timed(HttpClient.Request, self.io, 10000, HttpClient.request, .{ &client, .POST, uri, request_options })
+        try freeproxy.timed(HttpClient.Request, self.io, try ctx.remaining(self.io, 8000), HttpClient.request, .{ &client, .POST, uri, request_options })
     else
         try client.request(.POST, uri, request_options);
     defer req.deinit();
@@ -1609,15 +1629,22 @@ fn forwardAttempt(
     // Responses-wire providers send the translated body, not the original.
     const outbound = wire_body;
     const owned_body = try alloc.dupe(u8, outbound);
-    try req.sendBodyComplete(owned_body);
+    ctx.phase = "upload";
+    if (picked_proxy != null) {
+        try freeproxy.timed(void, self.io, try ctx.remaining(self.io, 8000), HttpClient.Request.sendBodyComplete, .{ &req, owned_body });
+    } else try req.sendBodyComplete(owned_body);
 
+    ctx.phase = "response headers";
     var redirect_buf: [512]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
+    var response = if (picked_proxy != null)
+        try freeproxy.timed(HttpClient.Response, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), HttpClient.Request.receiveHead, .{ &req, &redirect_buf })
+    else
+        try req.receiveHead(&redirect_buf);
 
     const status: u16 = @intFromEnum(response.head.status);
     if (picked_proxy) |picked| {
-        self.free_proxies.?.routeStatus(picked, status);
-        if (self.logger) |l| l.info("public proxy {s}:{d}: upstream HTTP {d}", .{ picked.host, picked.port, status });
+        if (!models.isHealthyStatus(status)) self.free_proxies.?.routeStatus(picked, status);
+        if (self.logger) |l| l.info("public proxy {s}:{d}: response headers {d} (body pending)", .{ picked.host, picked.port, status });
     }
     const ctype = response.head.content_type orelse "";
     const upstream_sse = headerValueHas(ctype, "text/event-stream");
@@ -1625,45 +1652,87 @@ fn forwardAttempt(
     var transfer: [4096]u8 = undefined;
     const reader = response.reader(&transfer);
 
+    ctx.phase = "response body";
     if (models.isHealthyStatus(status)) {
-        if (proxied) |*pr| pr.ok = true;
-        if (responses_mode) {
-            // Responses wire: the upstream always answers with one JSON
-            // document (stream is never propagated); translate it and shape
-            // it for the client as JSON or as synthesized chat SSE.
-            const resp_body = try bufferUpstreamBody(reader, alloc, max_body_bytes);
-            const upstream_model = routed_model_of(self.config, alloc, provider_idx, body) orelse "";
-            const chat_body = responses_mod.chatFromResponses(alloc, resp_body, fullModelId(self.config, alloc, provider_idx, upstream_model)) catch resp_body;
-            if (acc) |a| a.scan(chat_body);
-            if (sse_wanted) {
-                try sendSyntheticChat(writer, alloc, chat_body);
-            } else {
-                try sendJson(writer, status, chat_body);
-            }
-        } else if (upstream_sse) {
-            try sendSseHead(writer);
+        if (upstream_sse and !responses_mode) {
             var chunk: [32768]u8 = undefined;
+            var started = false;
+            var marker_line: [64]u8 = undefined;
+            var marker_len: usize = 0;
+            var marker_overflow = false;
+            var stream_done = false;
             while (true) {
-                const n = try readChunk(reader, &chunk);
+                // Before the first byte, all retries share the request deadline.
+                // Afterwards a live stream has an idle timeout, not a generation limit.
+                const n = if (picked_proxy != null)
+                    try freeproxy.timed(usize, self.io, if (started) self.config.timeout_ms else try ctx.remaining(self.io, self.config.timeout_ms), readChunk, .{ reader, &chunk })
+                else
+                    try readChunk(reader, &chunk);
                 if (n == 0) break;
+                for (chunk[0..n]) |byte| {
+                    if (byte == '\n') {
+                        if (!marker_overflow and isSseDoneLine(marker_line[0..marker_len])) stream_done = true;
+                        marker_len = 0;
+                        marker_overflow = false;
+                    } else if (marker_len < marker_line.len) {
+                        marker_line[marker_len] = byte;
+                        marker_len += 1;
+                    } else marker_overflow = true;
+                }
+                if (!started) {
+                    ctx.committed = true;
+                    sendSseHead(writer) catch {
+                        if (proxied) |*pr| pr.ok = null;
+                        return error.ClientDisconnected;
+                    };
+                    started = true;
+                }
                 if (acc) |a| a.scanSse(chunk[0..n]);
-                try sendSseChunk(writer, chunk[0..n]);
+                sendSseChunk(writer, chunk[0..n]) catch {
+                    if (proxied) |*pr| pr.ok = null;
+                    return error.ClientDisconnected;
+                };
             }
-            try sendSseEnd(writer);
+            if (!started) return error.EmptyUpstreamResponse;
+            if (!marker_overflow and isSseDoneLine(marker_line[0..marker_len])) stream_done = true;
+            if (picked_proxy != null and !stream_done) return error.IncompleteUpstreamStream;
+            if (proxied) |*pr| pr.ok = true;
+            if (picked_proxy) |picked| self.free_proxies.?.routeStatus(picked, status);
+            sendSseEnd(writer) catch return error.ClientDisconnected;
         } else {
-            const raw_body = try bufferUpstreamBody(reader, alloc, max_body_bytes);
-            const resp_body = try chatReply(alloc, raw_body);
+            const raw_body = if (picked_proxy != null)
+                try freeproxy.timed([]u8, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), bufferUpstreamBody, .{ reader, alloc, max_body_bytes })
+            else
+                try bufferUpstreamBody(reader, alloc, max_body_bytes);
+            if (raw_body.len == 0) return error.EmptyUpstreamResponse;
+            const resp_body = if (responses_mode) blk: {
+                const upstream_model = routed_model_of(self.config, alloc, provider_idx, body) orelse "";
+                break :blk try responses_mod.chatFromResponses(alloc, raw_body, fullModelId(self.config, alloc, provider_idx, upstream_model));
+            } else try chatReply(alloc, raw_body);
+            if (picked_proxy != null) {
+                const parsed_reply = std.json.parseFromSlice(std.json.Value, alloc, resp_body, .{}) catch return error.InvalidUpstreamResponse;
+                defer parsed_reply.deinit();
+                if (parsed_reply.value != .object) return error.InvalidUpstreamResponse;
+                const choices = parsed_reply.value.object.get("choices") orelse return error.InvalidUpstreamResponse;
+                if (choices != .array) return error.InvalidUpstreamResponse;
+            }
             if (acc) |a| a.scan(resp_body);
+            if (proxied) |*pr| pr.ok = true;
+            if (picked_proxy) |picked| self.free_proxies.?.routeStatus(picked, status);
+            ctx.committed = true;
             if (sse_wanted) {
-                try sendSyntheticChat(writer, alloc, resp_body);
-            } else try sendJson(writer, status, resp_body);
+                sendSyntheticChat(writer, alloc, resp_body) catch return error.ClientDisconnected;
+            } else sendJson(writer, status, resp_body) catch return error.ClientDisconnected;
         }
+        if (picked_proxy) |picked| if (self.logger) |l| l.info("public proxy {s}:{d}: completed HTTP {d}", .{ picked.host, picked.port, status });
         return .{ .status = status, .body = &.{} };
     }
 
-    const err_body = bufferUpstreamBody(reader, alloc, max_upstream_error_bytes) catch |err| {
+    const err_body = (if (picked_proxy != null)
+        freeproxy.timed([]u8, self.io, try ctx.remaining(self.io, 8000), bufferUpstreamBody, .{ reader, alloc, max_upstream_error_bytes })
+    else
+        bufferUpstreamBody(reader, alloc, max_upstream_error_bytes)) catch |err| {
         if (err == ProxyError.BodyTooLarge) return .{ .status = status, .body = &.{} };
-        if (proxied) |*pr| pr.ok = false;
         return err;
     };
     if (proxied) |*pr| pr.ok = !headerValueHas(ctype, "text/html") and status != 407;
@@ -1706,15 +1775,21 @@ fn handleCompletions(
     var acc: UsageAccum = .{ .alloc = alloc };
     defer acc.deinit();
     const ms_free_proxy = prov.use_free_proxy and self.free_proxies != null;
-    const max_attempts = if (ms_free_proxy) 12 else @min(prov.keys.len + 1, max_key_attempts);
+    const max_attempts = if (ms_free_proxy) 4 else @min(prov.keys.len + 1, max_key_attempts);
     var attempts: usize = 0;
     var prev_key: ?usize = null;
     var pending_failover: ?struct { from: usize, status: u16 } = null;
     var last_status: u16 = 503;
     var last_body: []const u8 = &.{};
     var tried_any = false;
+    var ctx: AttemptContext = .{ .deadline_ms = std.Io.Clock.awake.now(self.io).toMilliseconds() + self.config.timeout_ms };
 
     while (attempts < max_attempts) : (attempts += 1) {
+        if (ms_free_proxy and std.Io.Clock.awake.now(self.io).toMilliseconds() >= ctx.deadline_ms) {
+            last_status = 504;
+            last_body = &.{};
+            break;
+        }
         const key_idx = self.pickKey(p_idx) orelse break;
         if (!ms_free_proxy and prev_key != null and prev_key.? == key_idx and attempts > 0) break; // rotator stalled; avoid hammering
         prev_key = key_idx;
@@ -1727,7 +1802,15 @@ fn handleCompletions(
             pending_failover = null;
         }
 
-        var outcome = forwardAttempt(self, p_idx, key_idx, endpoint, upstream_body, ms.stream, writer, alloc, &acc) catch |err| {
+        var outcome = forwardAttempt(self, p_idx, key_idx, endpoint, upstream_body, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
+            if (err == error.ClientDisconnected) {
+                if (self.logger) |l| l.info("client disconnected; upstream request will not be replayed", .{});
+                return 499;
+            }
+            if (ctx.committed) {
+                if (self.logger) |l| l.warn("upstream stream interrupted during {s}: {s}; not replaying a partial response", .{ ctx.phase, @errorName(err) });
+                return 502; // Close the stream, never append another HTTP response.
+            }
             if (err == ProxyError.FreeProxyUnavailable) {
                 // Pool still warming / exhausted: not the key's fault. Fail
                 // the request without touching key health.
@@ -1735,21 +1818,28 @@ fn handleCompletions(
                     try sendJson(writer, last_status, last_body);
                     return last_status;
                 }
-                try sendStatus(writer, 503, "no HTTPS-capable public proxy is currently available; the pool is refreshing (API keys unchanged)");
+                try sendStatus(writer, 503, "public proxy routes are busy or unavailable; the pool is refreshing (API keys unchanged)");
                 return 503;
             }
             if (!ms_free_proxy) self.reportKey(p_idx, key_idx, null);
             if (self.metrics) |m| m.noteFailover();
-            if (self.logger) |l| l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
+            if (self.logger) |l| {
+                if (ms_free_proxy) l.warn("public proxy failed during {s}: {s} (API key unchanged)", .{ ctx.phase, @errorName(err) }) else l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
+            }
             pending_failover = .{ .from = key_idx, .status = 502 };
-            last_status = 502;
+            last_status = if (err == error.Timeout) 504 else 502;
             last_body = &.{};
             continue;
         };
         if (needsThinkingRepair(outcome.status, outcome.body)) {
             const repaired = try thinkingBody(alloc, upstream_body);
             if (self.logger) |l| l.info("model requires thinking; retrying once with low effort", .{});
-            outcome = try forwardAttempt(self, p_idx, key_idx, endpoint, repaired, ms.stream, writer, alloc, &acc);
+            outcome = forwardAttempt(self, p_idx, key_idx, endpoint, repaired, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
+                if (err == error.ClientDisconnected) return 499;
+                if (ctx.committed) return 502;
+                try sendStatus(writer, if (err == error.Timeout) 504 else 502, "upstream retry failed");
+                return if (err == error.Timeout) 504 else 502;
+            };
         }
         if (outcome.status >= 400 and outcome.status < 500 and
             !shouldFailoverStatus(outcome.status))

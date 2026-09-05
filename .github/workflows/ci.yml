@@ -24,6 +24,8 @@ jobs:
         run: zig build test -j2
       - name: Proxy integration and persistence
         run: python scripts/verify_compatibility.py
+      - name: Public proxy fault injection
+        run: python scripts/verify_proxy_faults.py
       - name: Executable smoke test
         shell: bash
         run: ./zig-out/bin/freepro-gui --version

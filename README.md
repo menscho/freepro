@@ -6,7 +6,7 @@
 
 A lightweight model proxy with an OpenAI-compatible API, automatic key rotation, and a compact dark dashboard.
 
-[Download v0.1.0](https://github.com/menscho/freepro/releases/tag/v0.1.0) · [Getting started](#getting-started) · [Build from source](#build-from-source)
+[Download v0.1.1](https://github.com/menscho/freepro/releases/tag/v0.1.1) · [Getting started](#getting-started) · [Build from source](#build-from-source)
 
 ![Version](https://img.shields.io/github/v/release/menscho/freepro?style=flat-square&color=879fff)
 ![License](https://img.shields.io/github/license/menscho/freepro?style=flat-square&color=879fff)
@@ -25,7 +25,7 @@ A lightweight model proxy with an OpenAI-compatible API, automatic key rotation,
 - **Model library:** choose which models clients can see, filter paid models, and configure reasoning levels.
 - **Usage you can inspect:** input, output, cached tokens, model breakdowns, daily history, and CSV export.
 - **Kimi Code setup:** add or update the local configuration with one button, then run `/reload`.
-- **Optional public proxy routing:** configure it per provider. This feature is experimental; proxy availability and upstream limits still apply.
+- **Optional public proxy routing:** configure it per provider. Routes are fully validated, limited to one active request each, and quarantined after failure. Retries share the configured timeout; a partial stream is never replayed. This feature is experimental; proxy availability and upstream limits still apply.
 - **Updates on your terms:** check GitHub once at startup; show an Update button only when a newer compatible release is available.
 
 The GUI is served locally and opens in your browser. Its HTML, styles, scripts, and logo are embedded in the executable—no Node.js server or frontend installation is needed.
@@ -34,13 +34,13 @@ The GUI is served locally and opens in your browser. Its HTML, styles, scripts, 
 
 | Platform | Standalone download |
 | --- | --- |
-| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.0/freepro-v0.1.0-windows-x86_64.exe) |
-| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.0/freepro-v0.1.0-linux-x86_64) |
-| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.0/freepro-v0.1.0-linux-arm64) |
-| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.0/freepro-v0.1.0-macos-arm64) |
-| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.0/freepro-v0.1.0-macos-x86_64) |
+| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.1/freepro-v0.1.1-windows-x86_64.exe) |
+| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.1/freepro-v0.1.1-linux-x86_64) |
+| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.1/freepro-v0.1.1-linux-arm64) |
+| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.1/freepro-v0.1.1-macos-arm64) |
+| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.1/freepro-v0.1.1-macos-x86_64) |
 
-Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.0/SHA256SUMS).
+Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.1/SHA256SUMS).
 
 ## Getting started
 
@@ -48,8 +48,8 @@ Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds
 2. On Windows, launch the `.exe`. On Linux or macOS, make the download executable and run it:
 
    ```sh
-   chmod +x ./freepro-v0.1.0-linux-x86_64
-   ./freepro-v0.1.0-linux-x86_64
+   chmod +x ./freepro-v0.1.1-linux-x86_64
+   ./freepro-v0.1.1-linux-x86_64
    ```
 
    Substitute your downloaded filename on macOS or ARM64.

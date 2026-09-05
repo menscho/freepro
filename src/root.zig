@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 pub const models = @import("models.zig");
 pub const rotator = @import("rotator.zig");
 pub const config = @import("config.zig");
+pub const freeproxy = @import("freeproxy.zig");
 pub const proxy = @import("proxy.zig");
 pub const upstream = @import("upstream.zig");
 pub const metrics = @import("metrics.zig");
@@ -18,7 +19,7 @@ pub const logger = @import("logger.zig");
 pub const netwin = if (builtin.os.tag == .windows) @import("netwin.zig") else struct {};
 pub const ui = @import("ui.zig");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 1 };
 
 test {
     std.testing.refAllDecls(@This());

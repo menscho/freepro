@@ -1,6 +1,6 @@
 .{
     .name = .freepro,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xfa3ffa8ad86e52ec,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
