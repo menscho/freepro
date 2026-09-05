@@ -204,9 +204,8 @@ pub const Pool = struct {
     }
 
     /// Called on every 429/403 verdict for `prefix`'s origin. Returns true
-    /// when the request should stop immediately (the origin is throttling
-    /// several observed routes); that provider's breaker then
-    /// trips open briefly. This NEVER deletes or retires a route: the
+    /// when the distinct-route threshold is reached. Call originThrottleBlocks
+    /// before stopping: other eligible routes must remain usable. This NEVER deletes or retires a route: the
     /// origin's mood is not the proxy's health.
     pub fn noteOriginThrottle(self: *Pool, prefix: []const u8, host: []const u8) bool {
         self.mu.lock();
@@ -228,7 +227,7 @@ pub const Pool = struct {
         if (strikes >= origin_breaker_threshold) {
             self.origin_breaker_until_ms[s] = at + origin_breaker_open_ms;
             self.origin_breaker_strikes[s] = 0;
-            self.logInfo("proxy pool: provider {s} throttled through {d} distinct proxies; pausing its proxied attempts briefly", .{ prefix, origin_breaker_threshold });
+            self.logInfo("proxy pool: provider {s} throttled on {d} routes; other eligible routes remain usable", .{ prefix, origin_breaker_threshold });
             return true;
         }
         return false;
