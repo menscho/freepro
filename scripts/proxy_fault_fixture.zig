@@ -15,13 +15,18 @@ pub fn main(init: std.process.Init) !void {
     var config: engine.models.ProxyConfig = .{ .port = try std.fmt.parseInt(u16, init.environ_map.get("TEST_PORT").?, 10), .timeout_ms = try std.fmt.parseInt(u32, init.environ_map.get("TEST_TIMEOUT").?, 10), .providers = &providers };
     var rotator = try engine.rotator.Rotator.init(init.gpa, &config);
     defer rotator.deinit();
-    var proxy = engine.proxy.Proxy.init(init.gpa, &config, .{ .io = init.io, .free_proxies = &pool, .rotator = &rotator, .dashboard = .{ .ctx = &pool, .handle_fn = stateHook } });
+    var log = engine.logger.Logger.init();
+    var proxy = engine.proxy.Proxy.init(init.gpa, &config, .{ .io = init.io, .logger = engine.proxy.Logger.wrap(&log), .free_proxies = &pool, .rotator = &rotator, .dashboard = .{ .ctx = &pool, .handle_fn = stateHook } });
     try proxy.start();
     var buffer: [128]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &buffer);
     _ = try stdin.interface.takeDelimiter('\n');
     proxy.stop();
-    const output = try std.json.Stringify.valueAlloc(a, .{ .key_state = @tagName(keys[0].state), .cooldown = keys[0].cooldown_until, .remaining_routes = pool.entries.items.len }, .{});
+    var lines: [32]engine.logger.LogLine = undefined;
+    const count = log.latest(&lines);
+    var messages: [32][]const u8 = undefined;
+    for (lines[0..count], 0..) |line, i| messages[i] = lines[i].msg[0..line.len];
+    const output = try std.json.Stringify.valueAlloc(a, .{ .key_state = @tagName(keys[0].state), .cooldown = keys[0].cooldown_until, .remaining_routes = pool.entries.items.len, .logs = messages[0..count] }, .{});
     try std.Io.File.stdout().writeStreamingAll(init.io, output);
 }
 

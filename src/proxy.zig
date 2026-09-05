@@ -796,19 +796,27 @@ const InboundRequest = struct {
     body: []const u8,
 };
 
-/// One chunk from a stream reader: returns as soon as ANY bytes are in hand.
-/// `std.Io.Reader.readSliceShort` fills its whole destination and only
-/// short-reads at EOF, which deadlocks request/response loops (the client
-/// waits for our reply while we wait to fill the buffer). `readVec` on every
-/// backend (std.Io.net, netwin) performs at most one socket read. Returns 0
-/// at clean EOF.
+/// Return buffered bytes immediately before asking the socket for more.
+/// Reader.readVec may otherwise copy a short buffered tail and then block for
+/// another read, even when that tail completes the HTTP body. A zero read can
+/// also mean the backend filled its internal buffer rather than reaching EOF.
 fn readChunk(r: *std.Io.Reader, dest: []u8) !usize {
-    var data = [1][]u8{dest};
-    const n = r.readVec(&data) catch |err| switch (err) {
-        error.EndOfStream => return 0,
-        else => return err,
-    };
-    return n;
+    if (dest.len == 0) return 0;
+    while (true) {
+        const buffered = r.buffered();
+        if (buffered.len != 0) {
+            const n = @min(buffered.len, dest.len);
+            @memcpy(dest[0..n], buffered[0..n]);
+            r.seek += n;
+            return n;
+        }
+        var data = [1][]u8{dest};
+        const n = r.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => return 0,
+            else => return err,
+        };
+        if (n != 0) return n;
+    }
 }
 
 fn readFramedMessage(reader: *std.Io.Reader, alloc: Allocator) ![]u8 {
@@ -3169,4 +3177,35 @@ test "usage accounting reads structured usage and reassembles split SSE events" 
     try std.testing.expectEqual(@as(u64, 123), acc.input);
     try std.testing.expectEqual(@as(u64, 45), acc.output);
     try std.testing.expectEqual(@as(u64, 67), acc.cached);
+}
+
+test "readChunk returns a buffered tail without another socket read" {
+    var bytes = [_]u8{ 'O', 'K' };
+    var reader = std.Io.Reader.failing;
+    reader.buffer = &bytes;
+    reader.end = bytes.len;
+    var output: [8192]u8 = undefined;
+    const n = try readChunk(&reader, &output);
+    try std.testing.expectEqualStrings("OK", output[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), reader.bufferedLen());
+}
+
+test "readChunk handles a backend that only fills its internal buffer" {
+    const Backend = struct {
+        fn read(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            r.buffer[0] = 'X';
+            r.end = 1;
+            return 0;
+        }
+    };
+    var bytes: [8]u8 = undefined;
+    var reader: std.Io.Reader = .{
+        .vtable = &.{ .stream = std.Io.Reader.failing.vtable.stream, .readVec = Backend.read },
+        .buffer = &bytes,
+        .seek = 0,
+        .end = 0,
+    };
+    var output: [16]u8 = undefined;
+    const n = try readChunk(&reader, &output);
+    try std.testing.expectEqualStrings("X", output[0..n]);
 }

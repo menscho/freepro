@@ -88,7 +88,7 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
   output,err=proc.communicate(b'quit\n',timeout=10)
   assert proc.returncode==0,err.decode(errors='replace')[-2000:]
   state=json.loads(output);assert state['cooldown']==0,state
-  assert raw.count(b'HTTP/1.1')==1,raw[:500]
+  assert raw.count(b'HTTP/1.1')==1,(raw[:500],state,err.decode(errors='replace')[-2000:])
   return raw,elapsed,[h.seen for h in hops],state
  finally:
   if proc.poll() is None:proc.kill();proc.wait()
