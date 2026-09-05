@@ -38,6 +38,9 @@ fn nowMs() i64 {
 
 pub const max_pool: usize = 256;
 pub const max_latency_ms: u64 = 4000;
+/// Origin probe deadline: a proxy that works for the origin answers fast; a
+/// slow one is not worth waiting for, so reject quickly and try the next.
+pub const origin_probe_ms: u64 = 2500;
 /// A proxy is dropped once `fails` reaches this limit. `fails` grows only on
 /// neutral-probe failures (or on real-request transport failures that the
 /// proxy itself caused); a proxy that had a bad stretch recovers because
@@ -53,7 +56,7 @@ pub const list_refresh_ms: i64 = 5 * 60 * 1000;
 /// Cadence of the "tester (use)": re-validate idle routes against the neutral
 /// target and let scores recover.
 pub const validation_refresh_ms: i64 = 45 * 1000;
-pub const validation_workers: usize = 40;
+pub const validation_workers: usize = 64;
 /// The pool is considered full enough at this many ready routes; when it drops
 /// below, the next check triggers an immediate fetch (POOL_SIZE_MIN analog).
 pub const target_ready: usize = 128;
@@ -105,35 +108,79 @@ pub const Entry = struct {
 /// All of them re-publish on their own cadence (every 5-60 minutes), so a
 /// plain re-fetch is a fresh list. Sources are merged fairly; one large list
 /// cannot hide the rest.
+/// Public proxy-list sources. Text sources return `ip:port` (some scheme-
+/// prefixed) lines; JSON sources carry per-proxy latency/uptime so validation
+/// starts on the likeliest-good proxies. Every URL here was verified live on
+/// 2026-09-05. HTTP/HTTPS only - the pool speaks CONNECT, never SOCKS.
+/// Sources are merged fairly (interleaved) so no single large list dominates,
+/// and one dead source never blocks the rest (each fetch has its own deadline).
 const list_sources = [_][]const u8{
-    // -- verified live 2026-09-05; high-volume text lists --
+    // -- high-volume text lists --
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/https/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies.txt",
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
     "https://raw.githubusercontent.com/ioproxy/Proxy-List/main/http.txt",
     "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/all.txt",
     "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
-    // -- more aggregates (verified live) --
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+    // -- large scrapers (big reservoirs; refreshed on their own cadence) --
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
+    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/all.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
     "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/generated/http_proxies.txt",
+    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
     "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
     "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
-    // -- frequently-refreshed aggregates --
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
+    "https://raw.githubusercontent.com/almroot/proxylist/master/list.txt",
+    // -- per-country slices (fresh, geographically diverse) --
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/US/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/DE/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/GB/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/FR/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/NL/data.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/RU/data.txt",
+    // -- frequently-refreshed APIs --
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&timeout=3000",
     "https://www.proxy-list.download/api/v1/get?type=http",
     "https://www.proxy-list.download/api/v1/get?type=https",
     "https://proxyspace.pro/http.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://proxylist.geonode.com/api/proxy-list?limit=1000&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps",
     "https://raw.githubusercontent.com/databay-labs/free-proxy-list/main/http.txt",
     "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
     "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/all-proxies.txt",
     "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_ssl.txt",
     "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_ssl_elite.txt",
+    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_anonymous.txt",
+    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/all_ssl.txt",
+    // -- hproxy (text tiers + JSON with latency/uptime for prioritization) --
     "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/http.txt",
-    // -- JSON with per-proxy latency/uptime (used for prioritization) --
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/https.txt",
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/elite.txt",
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/fast.txt",
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/live.txt",
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/anonymous.txt",
     "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json",
 };
@@ -787,7 +834,7 @@ pub const Pool = struct {
                 // An anonymous catalog check is an additional reachability signal.
                 // It cannot guarantee that a generation will be accepted.
                 if (job.pool.probe_origin.len != 0) {
-                    const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
+                    const origin_ok = timed(bool, job.pool.io, origin_probe_ms, probeOriginOk, .{
                         job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
                     }) catch false;
                     if (!origin_ok) {
@@ -992,30 +1039,63 @@ pub const Pool = struct {
 
     /// Folds per-proxy latency metadata from JSON sources into already-parsed
     /// candidates (matched by "ip:port"). Pure text bodies are skipped.
+    /// Folds per-proxy latency metadata from JSON sources into already-parsed
+    /// candidates (matched by ip:port). Handles both top-level arrays
+    /// (hproxy/monosans: `[{proxy|ip, port, latency_ms}]`) and the geonode
+    /// `{"data":[{ip, port, latency}]}` shape. Pure-text bodies are skipped.
     fn mergeJsonMetadata(pool: *Pool, alloc: Allocator, bodies: []const ?[]const u8, out: *CandidateList) !void {
         _ = pool;
-        var hp_buf: [64]u8 = undefined;
         for (bodies) |body| {
             const bytes = body orelse continue;
             const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-            if (trimmed.len < 2 or trimmed[0] != '[') continue;
-            const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch continue;
+            if (trimmed.len < 2 or (trimmed[0] != '[' and trimmed[0] != '{')) continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
-            if (parsed.value != .array) continue;
-            for (parsed.value.array.items) |item| {
+            const items: []const std.json.Value = switch (parsed.value) {
+                .array => |a| a.items,
+                .object => |o| if (o.get("data")) |d| (if (d == .array) d.array.items else return) else continue,
+                else => continue,
+            };
+            for (items) |item| {
                 if (item != .object) continue;
-                const proxy_str = (item.object.get("proxy") orelse item.object.get("ip") orelse continue);
-                if (proxy_str != .string) continue;
-                const host_port = proxy_str.string;
-                const latency_val = item.object.get("latency_ms");
-                if (latency_val == null or latency_val.? != .integer) continue;
-                const latency: u32 = @intCast(@max(0, @min(std.math.maxInt(u32), latency_val.?.integer)));
-                for (out.items) |*c| {
-                    const hp = std.fmt.bufPrint(&hp_buf, "{s}:{d}", .{ c.host, c.port }) catch continue;
-                    if (std.mem.eql(u8, hp, host_port)) {
-                        c.latency_estimate = latency;
-                        break;
+                // Resolve host + port from either a "proxy" string or ip+port.
+                var host_buf: []const u8 = "";
+                var port: u16 = 0;
+                if (item.object.get("proxy")) |p| {
+                    if (p == .string) {
+                        var s = p.string;
+                        if (std.mem.indexOfScalar(u8, s, '/')) |slash| s = s[slash + 1 ..];
+                        if (std.mem.lastIndexOfScalar(u8, s, ':')) |colon| {
+                            host_buf = s[0..colon];
+                            port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch 0;
+                        }
                     }
+                } else if (item.object.get("ip")) |ip| {
+                    if (ip == .string) host_buf = ip.string;
+                    if (item.object.get("port")) |pp| switch (pp) {
+                        .integer => |v| port = @intCast(@max(0, @min(std.math.maxInt(u16), v))),
+                        .string => |sv| port = std.fmt.parseInt(u16, sv, 10) catch 0,
+                        else => {},
+                    };
+                }
+                if (host_buf.len == 0 or port == 0) continue;
+                // Latency field name varies across sources.
+                const latency = blk: {
+                    for ([_][]const u8{ "latency_ms", "latency", "responseTime", "response_time" }) |key| {
+                        const v = item.object.get(key) orelse continue;
+                        switch (v) {
+                            .integer => |n| break :blk @as(u32, @intCast(@max(@as(i64, 0), @min(@as(i64, std.math.maxInt(u32)), n)))),
+                            .float => |x| break :blk @as(u32, @intFromFloat(@max(@as(f64, 0), @min(@as(f64, std.math.maxInt(u32)), x)))),
+                            else => {},
+                        }
+                    }
+                    continue;
+                };
+                for (out.items) |*c| {
+                    if (c.port != port) continue;
+                    if (!std.mem.eql(u8, c.host, host_buf)) continue;
+                    c.latency_estimate = latency;
+                    break;
                 }
             }
         }
