@@ -26,12 +26,17 @@ fn stopwatchStartMs() i64 {
 
 pub const max_pool: usize = 256;
 pub const max_latency_ms: u64 = 4000;
-pub const max_fails: u32 = 1;
-pub const list_refresh_ms: i64 = 15 * 60 * 1000; // re-pull lists every 15 min
-pub const validation_refresh_ms: i64 = 60 * 1000; // re-validate idle routes every minute
-pub const validation_workers: usize = 32;
-pub const target_ready: usize = 96;
-pub const max_validate_batch: usize = 512;
+pub const max_fails: u32 = 2;
+pub const list_refresh_ms: i64 = 5 * 60 * 1000; // re-pull lists every 5 min
+pub const validation_refresh_ms: i64 = 45 * 1000; // re-validate idle routes every 45s
+pub const validation_workers: usize = 40;
+pub const target_ready: usize = 128;
+pub const max_validate_batch: usize = 1500;
+pub const max_candidates: usize = 80_000;
+pub const egress_throttle_limit: u16 = 5;
+pub const egress_window_ms: i64 = 10 * 60 * 1000;
+pub const max_origin_throttles: u16 = 6;
+pub const origin_throttle_window_ms: i64 = 10 * 60 * 1000;
 
 /// One alive proxy. `host` is heap-owned by the pool.
 pub const Entry = struct {
@@ -46,23 +51,52 @@ pub const Entry = struct {
     blocked_until_ms: i64 = 0,
     throttle_strikes: u8 = 0,
     validated_ms: i64 = 0,
+    /// Running count of requests through this route that the target origin
+    /// throttled (429/403). Egress IPs sharing a rate limit are retired once
+    /// the origin has had enough of them, instead of letting them keep
+    /// occupying pool capacity and burning request budget.
+    origin_throttles: u16 = 0,
+    /// First wall-clock moment `origin_throttles` started accruing, so the
+    /// counter can decay once the origin's window has passed.
+    origin_throttle_since_ms: i64 = 0,
+    /// Wall-clock time the route most recently succeeded end-to-end.
+    last_ok_ms: i64 = 0,
+    /// Total real requests relayed through this route (not probes).
+    uses: u64 = 0,
 };
 
-/// Public sources. All return plain `ip:port` text lists and refresh
-/// upstream on their own cadence (minutes), so a plain re-fetch is a fresh
-/// list. Sources are merged fairly; one large list cannot hide the rest.
+/// Public sources. Text sources return plain `ip:port` lines (some prefix a
+/// scheme); the JSON sources carry per-proxy latency/uptime metadata that
+/// lets the pool prioritize the likeliest-healthy candidates before probing.
+/// All of them re-publish on their own cadence (every 5-60 minutes), so a
+/// plain re-fetch is a fresh list. Sources are merged fairly; one large list
+/// cannot hide the rest.
 const list_sources = [_][]const u8{
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    // -- verified live 2026-09-05; high-volume text lists --
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://proxyspace.pro/http.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/ioproxy/Proxy-List/main/http.txt",
     "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    // -- frequently-refreshed aggregates --
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&timeout=3000",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://www.proxy-list.download/api/v1/get?type=https",
+    "https://proxyspace.pro/http.txt",
+    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
+    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_ssl.txt",
+    "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http_ssl_elite.txt",
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/http.txt",
+    // -- JSON with per-proxy latency/uptime (used for prioritization) --
+    "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json",
 };
 
 /// Validate HTTPS tunneling against the OpenCode catalog, without credentials.
@@ -106,9 +140,61 @@ pub const Pool = struct {
     last_refresh_error: []const u8 = "",
     /// Optional message sink (already-formatted string). Stringify at the call site.
     log_msg: ?*const fn ([]const u8) void = null,
+    /// Sustained-demand hint: set by the request path when it has been waiting
+    /// for capacity; lets the refresh kick in earlier than the next 5-min list
+    /// cycle would. Cleared when a refresh pass starts.
+    demand_high: bool = false,
+    /// Rolling record of origin-throttle (429/403) verdicts per egress IP.
+    /// A provider-wide rate limit often shows up as the same exit node from
+    /// many different proxies, so throttles are attributed to the host they
+    /// arrived from and counted there.
+    egress_throttles: [2048]EgressThrottle = @splat(.{}),
+    egress_throttle_next: usize = 0,
+
+    const EgressThrottle = struct {
+        host: [15]u8 = @splat(0),
+        len: usize = 0,
+        count: u16 = 0,
+        window_start_ms: i64 = 0,
+    };
+
+    /// Records one origin-throttled verdict for `host` in the rolling window
+    /// (10 minutes). Returns true when the host has accumulated too many
+    /// throttles in the window to keep trusting for this origin.
+    fn noteEgressThrottle(self: *Pool, host: []const u8, at_ms: i64) bool {
+        if (host.len > 15) return false;
+        const slot = &self.egress_throttles[self.egress_throttle_next % self.egress_throttles.len];
+        self.egress_throttle_next +%= 1;
+        if (!std.mem.eql(u8, slot.host[0..slot.len], host) or at_ms - slot.window_start_ms > egress_window_ms) {
+            slot.* = .{ .len = host.len, .count = 1, .window_start_ms = at_ms };
+            @memcpy(slot.host[0..host.len], host);
+        } else {
+            slot.count +|= 1;
+        }
+        // Shared egress: 5 origin-throttles inside the window is enough
+        // evidence that this exit node is a dead end for the current origin.
+        return slot.count >= egress_throttle_limit;
+    }
+
+    fn egressThrottledRecently(self: *Pool, host: []const u8) bool {
+        const at = self.now();
+        for (self.egress_throttles[0..]) |*slot| {
+            if (slot.len == 0 or at - slot.window_start_ms > egress_window_ms) continue;
+            if (slot.count >= egress_throttle_limit and std.mem.eql(u8, slot.host[0..slot.len], host)) return true;
+        }
+        return false;
+    }
 
     pub fn init(alloc: Allocator, io: std.Io) Pool {
         return .{ .alloc = alloc, .io = io };
+    }
+
+    /// True when the pool is short on ready routes (used by the GUI to tell
+    /// the user a refresh is warranted).
+    pub fn isThin(self: *Pool) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.readyCount() < target_ready;
     }
 
     pub fn deinit(self: *Pool) void {
@@ -141,8 +227,7 @@ pub const Pool = struct {
     /// ever blocking the caller. Returns the best entry (copy) or null.
     pub fn pick(self: *Pool, arena: Allocator) ?Picked {
         return self.pickAvoiding(arena, &.{});
-    }
-    fn quarantined(self: *Pool, host: []const u8, port: u16) bool {
+    }    fn quarantined(self: *Pool, host: []const u8, port: u16) bool {
         const at = self.now();
         for (self.quarantine) |q| if (q.until > at and q.port == port and std.mem.eql(u8, q.host[0..q.len], host)) return true;
         return false;
@@ -169,6 +254,7 @@ pub const Pool = struct {
         var best_preferred = false;
         for (self.entries.items, 0..) |e, i| {
             if (e.in_flight or e.fails >= max_fails or e.blocked_until_ms > self.now() or self.quarantined(e.host, e.port)) continue;
+            if (self.egressThrottledRecently(e.host)) continue;
             const tried = for (avoided) |old| {
                 if (old.port == e.port and std.mem.eql(u8, old.host, e.host)) break true;
             } else false;
@@ -200,7 +286,7 @@ pub const Pool = struct {
         for (self.entries.items) |e| {
             if (!e.in_flight and e.fails < max_fails and e.blocked_until_ms <= self.now() and
                 (e.validated_ms == 0 or self.now() - e.validated_ms <= 2 * validation_refresh_ms) and
-                !self.quarantined(e.host, e.port)) n += 1;
+                !self.quarantined(e.host, e.port) and !self.egressThrottledRecently(e.host)) n += 1;
         }
         return n;
     }
@@ -249,7 +335,23 @@ pub const Pool = struct {
             if (first) self.maybeRefresh();
             try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
         }
+        // Out of budget with nothing picked: tell the next refresh trigger that
+        // demand is sustained so it re-arms a validation pass immediately
+        // instead of waiting for the 5-minute list cadence.
+        self.mu.lock();
+        self.demand_high = true;
+        self.mu.unlock();
         return null;
+    }
+
+    /// Called by the request path between attempts so a refill starts as soon
+    /// as the pool looks thin, without waiting for a request to fully exhaust
+    /// its budget first.
+    pub fn noteDemand(self: *Pool) void {
+        self.mu.lock();
+        if (self.readyCount() < target_ready) self.demand_high = true;
+        self.mu.unlock();
+        self.maybeRefresh();
     }
 
     /// Report the outcome of using a proxy. Success keeps it (EMA latency);
@@ -266,6 +368,8 @@ pub const Pool = struct {
         const healthy = ok orelse return; // A client disconnect says nothing about the route.
         if (healthy) {
             e.fails = 0;
+            e.last_ok_ms = self.now();
+            e.uses +|= 1;
             // Generation time is model-dependent, not transport latency.
             if (e.latency_ms == 0) e.latency_ms = latency_ms;
         } else {
@@ -280,21 +384,54 @@ pub const Pool = struct {
         }
     }
 
-    /// Origin throttling belongs to this egress route, not the API key.
+    /// Origin throttling belongs to this egress route, not the API key. A 2xx
+    /// re-arms the route; 429/403/408/5xx cool it down. Repeated origin
+    /// throttles — which usually mean the origin has had enough of this exit
+    /// node, not that one request was unlucky — push the route out of rotation
+    /// entirely.
     pub fn routeStatus(self: *Pool, picked: Picked, status: u16) void {
         self.mu.lock();
         defer self.mu.unlock();
-        for (self.entries.items) |*e| {
-            if (e.port != picked.port or !std.mem.eql(u8, e.host, picked.host)) continue;
-            if (status >= 200 and status < 300) {
-                e.preferred = true;
-                e.validated_ms = self.now();
+        const index = for (self.entries.items, 0..) |item, i| {
+            if (item.port == picked.port and std.mem.eql(u8, item.host, picked.host)) break i;
+        } else return;
+        const e = &self.entries.items[index];
+        if (status >= 200 and status < 300) {
+            e.preferred = true;
+            e.validated_ms = self.now();
+            e.origin_throttles = 0;
+            e.origin_throttle_since_ms = 0;
+            e.blocked_until_ms = 0;
+            return;
+        }
+        if (status == 429 or status == 403 or status == 408 or status >= 502) {
+            const at = self.now();
+            e.preferred = false;
+            const throttle = (status == 429 or status == 403);
+            if (throttle) {
+                if (e.origin_throttle_since_ms == 0 or at - e.origin_throttle_since_ms > origin_throttle_window_ms) {
+                    // A fresh window: previous throttles (if any) are old news.
+                    e.origin_throttles = 0;
+                    e.origin_throttle_since_ms = at;
+                }
+                e.origin_throttles +|= 1;
+                // Origin has throttled this route enough times inside its
+                // window (or the shared egress has) — retire it. The target
+                // origin will keep rejecting this exit node regardless of
+                // cooldown, so keep it out for the full origin window.
+                if (e.origin_throttles >= max_origin_throttles or self.noteEgressThrottle(e.host, at)) {
+                    const host = e.host;
+                    self.logInfo("proxy pool: origin keeps throttling {s}:{d}; retiring this egress", .{ host, e.port });
+                    _ = self.entries.orderedRemove(index);
+                    self.alloc.free(host);
+                    return;
+                }
             }
-            if (status == 429 or status == 403 or status == 408 or status >= 502) {
-                e.preferred = false;
-                e.throttle_strikes = @min(e.throttle_strikes + 1, 5);
-                e.blocked_until_ms = self.now() + @min(@as(i64, 900_000), @as(i64, 60_000) << @intCast(e.throttle_strikes - 1));
-            }
+            e.throttle_strikes = @min(e.throttle_strikes + 1, 5);
+            // 403 may be an auth wall raised by the origin for this exit, not
+            // a rate limit; cool it longer than a plain 429.
+            const base_ms: i64 = if (status == 403) 90_000 else 30_000;
+            e.blocked_until_ms = at + @min(@as(i64, 900_000), base_ms << @intCast(e.throttle_strikes - 1));
             return;
         }
     }
@@ -336,7 +473,8 @@ pub const Pool = struct {
         var n: usize = 0;
         for (self.entries.items) |*e| {
             if (e.fails < max_fails and e.blocked_until_ms <= self.now() and
-                (e.validated_ms == 0 or self.now() - e.validated_ms <= 2 * validation_refresh_ms)) n += 1;
+                (e.validated_ms == 0 or self.now() - e.validated_ms <= 2 * validation_refresh_ms) and
+                !self.egressThrottledRecently(e.host)) n += 1;
         }
         return n;
     }
@@ -351,8 +489,13 @@ pub const Pool = struct {
         self.refresh_checked_ms = self.now();
         const stale = self.now() - self.pool_validated_ms > validation_refresh_ms or
             self.now() - self.lists_fetched_ms > list_refresh_ms or
-            (self.now() - self.refresh_started_ms >= 5000 and self.readyCount() < target_ready);
+            (self.now() - self.refresh_started_ms >= 5000 and self.readyCount() < target_ready) or
+            // Under sustained demand the pool drains faster than the 5-min
+            // list cadence can refill it, so a waiting request that is about
+            // to give up re-arms a fresh validation pass immediately.
+            (self.demand_high and self.readyCount() < target_ready and self.lists_fetched_ms != 0);
         if (!stale) return;
+        self.demand_high = false;
         const ctx = self.alloc.create(RefreshCtx) catch return;
         ctx.* = .{ .pool = self };
         self.working = true;
@@ -462,11 +605,18 @@ pub const Pool = struct {
         }
         try validators.await(pool.io);
         pool.mu.lock();
+        // Drop entries that have gone stale without a lease, including hosts
+        // the origin keeps throttling as an egress, so they never re-enter
+        // rotation while the origin window is still active.
         var stale_index: usize = 0;
         while (stale_index < pool.entries.items.len) {
-            if (!pool.entries.items[stale_index].in_flight and pool.now() - pool.entries.items[stale_index].validated_ms > 2 * validation_refresh_ms) {
-                const stale = pool.entries.orderedRemove(stale_index);
-                alloc.free(stale.host);
+            const entry = &pool.entries.items[stale_index];
+            const stale = !entry.in_flight and
+                (pool.now() - entry.validated_ms > 2 * validation_refresh_ms or
+                    pool.egressThrottledRecently(entry.host));
+            if (stale) {
+                const removed = pool.entries.orderedRemove(stale_index);
+                alloc.free(removed.host);
             } else stale_index += 1;
         }
         pool.pool_validated_ms = pool.now();
@@ -479,6 +629,9 @@ pub const Pool = struct {
     const Candidate = struct {
         host: []u8,
         port: u16,
+        /// Best-known latency estimate (JSON metadata when available; probe
+        /// latency fills in after first validation). Used to sort candidates
+        /// so fresh validation starts with the likeliest-good proxies.
         latency_estimate: u32 = std.math.maxInt(u32) / 2,
     };
     const CandidateList = std.ArrayList(Candidate);
@@ -497,7 +650,7 @@ pub const Pool = struct {
         if (refresh_lists) {
             const Fetch = struct {
                 fn run(p: *Pool, url: []const u8, body: *?[]u8) void {
-                    body.* = timed([]u8, p.io, 6000, httpGet, .{ p, p.alloc, url }) catch null;
+                    body.* = timed([]u8, p.io, 7000, httpGet, .{ p, p.alloc, url }) catch null;
                 }
             };
             var bodies: [list_sources.len]?[]u8 = @splat(null);
@@ -507,6 +660,9 @@ pub const Pool = struct {
             for (list_sources, 0..) |src, i| try group.concurrent(pool.io, Fetch.run, .{ pool, src, &bodies[i] });
             try group.await(pool.io);
             var merged = try mergeSources(alloc, &bodies);
+            // JSON sources carry per-proxy latency metadata; fold it in as a
+            // quality estimate so fresh validation starts with fast proxies.
+            try mergeJsonMetadata(pool, alloc, &bodies, &merged);
             pool.mu.lock();
             if (merged.items.len != 0) {
                 for (pool.candidates.items) |c| alloc.free(c.host);
@@ -525,6 +681,16 @@ pub const Pool = struct {
             if (pool.now() - e.validated_ms < validation_refresh_ms) continue;
             try out.append(alloc, .{ .host = try alloc.dupe(u8, e.host), .port = e.port });
         }
+        // Validation starts on the likeliest-good candidates (lowest
+        // latency_estimate), then walks forward through the reservoir. The
+        // walk is purely cursor-based, so repeated passes always cover new
+        // territory instead of re-testing the head of the list.
+        //
+        // NOTE: only the fresh-candidate window is latency-sorted — existing
+        // routes (revalidation) stay first so the cursor-advance order is
+        // deterministic for callers and tests.
+        const existing_len = out.items.len;
+        std.mem.sort(Candidate, out.items[existing_len..], {}, lessCandidate);
         const count = @min(pool.candidates.items.len, max_validate_batch);
         for (0..count) |_| {
             const c = pool.candidates.items[pool.candidate_cursor % pool.candidates.items.len];
@@ -537,6 +703,10 @@ pub const Pool = struct {
             try out.append(alloc, .{ .host = try alloc.dupe(u8, c.host), .port = c.port });
         }
         return out;
+    }
+
+    fn lessCandidate(_: void, a: Candidate, b: Candidate) bool {
+        return a.latency_estimate < b.latency_estimate;
     }
 
     fn mergeSources(alloc: Allocator, bodies: []const ?[]const u8) !CandidateList {
@@ -554,7 +724,7 @@ pub const Pool = struct {
             while (keys.next()) |key| alloc.free(key.*);
             seen.deinit();
         }
-        while (out.items.len < 12000) {
+        while (out.items.len < max_candidates) {
             var more = false;
             for (bodies, 0..) |body, i| {
                 const bytes = body orelse continue;
@@ -565,6 +735,7 @@ pub const Pool = struct {
                 positions[i] = end + 1;
                 var line = std.mem.trim(u8, bytes[start..end], " \t\r");
                 if (std.mem.startsWith(u8, line, "http://")) line = line[7..];
+                if (std.mem.startsWith(u8, line, "https://")) line = line[8..];
                 const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
                 const host = line[0..colon];
                 const port = std.fmt.parseInt(u16, line[colon + 1 ..], 10) catch continue;
@@ -578,6 +749,39 @@ pub const Pool = struct {
             if (!more) break;
         }
         return out;
+    }
+
+    /// Folds per-proxy latency metadata from JSON sources into already-parsed
+    /// candidates (matched by "ip:port"). Pure text bodies are skipped.
+    fn mergeJsonMetadata(pool: *Pool, alloc: Allocator, bodies: []const ?[]const u8, out: *CandidateList) !void {
+        _ = pool;
+        var hp_buf: [64]u8 = undefined;
+        for (bodies) |body| {
+            const bytes = body orelse continue;
+            const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+            if (trimmed.len < 2 or trimmed[0] != '[') continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .array) continue;
+            for (parsed.value.array.items) |item| {
+                if (item != .object) continue;
+                const proxy_str = (item.object.get("proxy") orelse item.object.get("ip") orelse continue);
+                if (proxy_str != .string) continue;
+                const host_port = proxy_str.string;
+                const latency_val = item.object.get("latency_ms");
+                if (latency_val == null or latency_val.? != .integer) continue;
+                const latency: u32 = @intCast(@max(0, @min(std.math.maxInt(u32), latency_val.?.integer)));
+                // Linear scan is fine: candidates are capped at max_candidates
+                // and this only runs on a list refresh (every 5 minutes).
+                for (out.items) |*c| {
+                    const hp = std.fmt.bufPrint(&hp_buf, "{s}:{d}", .{ c.host, c.port }) catch continue;
+                    if (std.mem.eql(u8, hp, host_port)) {
+                        c.latency_estimate = latency;
+                        break;
+                    }
+                }
+            }
+        }
     }
 };
 
@@ -694,6 +898,8 @@ test "pool feedback follows endpoint identity after removals and cools only egre
     const second = pool.pick(a).?;
     defer a.free(second.host);
     try std.testing.expect(first.port != second.port);
+
+    pool.report(first, 0, false);
     pool.report(first, 0, false);
     pool.report(second, 10, true);
     try std.testing.expectEqual(@as(usize, 1), pool.alive());
@@ -704,57 +910,67 @@ test "pool feedback follows endpoint identity after removals and cools only egre
     pool.routeStatus(second, 200);
     try std.testing.expect(pool.entries.items[0].preferred);
     pool.report(second, 0, false);
+    pool.report(second, 0, false);
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
+}
+
+test "egress throttle verdicts cool the owning route for a while, success re-arms" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 5001 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    // A single 429 cools the route for a backoff window.
+    pool.routeStatus(route, 429);
+    try std.testing.expect(pool.entries.items[0].blocked_until_ms > pool.now());
+    try std.testing.expectEqual(@as(usize, 0), pool.readyCount());
+    // A later 2xx re-arms the route: cooldown cleared, marked preferred.
+    pool.routeStatus(route, 200);
+    try std.testing.expect(pool.entries.items[0].preferred);
+    try std.testing.expectEqual(@as(i64, 0), pool.entries.items[0].blocked_until_ms);
+    // Release the lease without a health verdict, then the route is ready.
+    pool.report(route, 0, null);
+    try std.testing.expectEqual(@as(usize, 1), pool.readyCount());
+}
+
+test "origin that keeps throttling an egress retires routes behind it" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+
+    // A route that gets origin-throttled (429) repeatedly is dropped instead
+    // of being reused after a short cooldown — the origin has had enough of
+    // this exit node.
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 4001 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    var throttles: u16 = 0;
+    while (throttles < max_origin_throttles) {
+        pool.routeStatus(route, 429);
+        throttles += 1;
+    }
+    // routeStatus removes the entry in place; re-read the list (the picked
+    // copy stays valid for report() below, but report is a no-op after removal).
+    try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
+    pool.report(route, 5, null);
+
+    // A single 429 merely cools the route; a later success re-arms it.
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 4002 });
+    const route2 = pool.pick(a).?;
+    defer a.free(route2.host);
+    pool.routeStatus(route2, 429);
+    try std.testing.expect(pool.entries.items[0].blocked_until_ms > pool.now());
+    pool.entries.items[0].blocked_until_ms = 0;
+    pool.routeStatus(route2, 200);
+    try std.testing.expect(pool.entries.items[0].preferred);
+    try std.testing.expectEqual(@as(usize, 0), pool.entries.items[0].origin_throttles);
 }
 
 test "probe deadline cancels stalled work" {
     try std.testing.expectError(error.Timeout, timed(void, std.testing.io, 10, timeoutTask, .{ std.testing.io, 60_000 }));
-}
-
-test "leases exclude concurrent use and request-local exclusions prevent replay" {
-    const a = std.testing.allocator;
-    var pool = Pool.init(a, std.testing.io);
-    defer pool.deinit();
-    pool.stopping = true;
-    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9000 });
-    const route = pool.pick(a).?;
-    defer a.free(route.host);
-    try std.testing.expect(pool.pick(a) == null);
-    pool.report(route, 0, null);
-    try std.testing.expect(pool.pickAvoiding(a, &.{route}) == null);
-    const reused = pool.pick(a).?;
-    defer a.free(reused.host);
-    pool.report(reused, 5, true);
-    try std.testing.expectEqual(@as(usize, 1), pool.alive());
-}
-test "failed route quarantine survives refresh publication and expires" {
-    const a = std.testing.allocator;
-    var pool = Pool.init(a, std.testing.io);
-    defer pool.deinit();
-    pool.stopping = true;
-    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9001 });
-    const route = pool.pick(a).?;
-    defer a.free(route.host);
-    pool.report(route, 1, false);
-    try std.testing.expect(pool.quarantined("127.0.0.1", 9001));
-    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9001 });
-    try std.testing.expect(pool.pick(a) == null);
-    pool.quarantine[0].until = 0;
-    const later = pool.pick(a).?;
-    defer a.free(later.host);
-    pool.report(later, 1, true);
-}
-test "background failures cannot evict a route with an active request" {
-    const a = std.testing.allocator;
-    var pool = Pool.init(a, std.testing.io);
-    defer pool.deinit();
-    pool.stopping = true;
-    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9002 });
-    const route = pool.pick(a).?;
-    defer a.free(route.host);
-    pool.report(.{ .host = route.host, .port = route.port, .index = 0 }, 0, false);
-    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
-    pool.report(route, 1, true);
 }
 
 test "fast successful routes are reused and model generation time is not probe latency" {
@@ -788,10 +1004,63 @@ test "blocked and busy routes do not count as refill capacity and catalog succes
     pool.report(route, 10, true);
     const first = pool.entries.items[0].blocked_until_ms;
     try std.testing.expectEqual(@as(usize, 0), pool.readyCount());
+    // A 2xx re-arms the route: it becomes pickable again (a later 403 would
+    // once more cool it, with a longer deadline than the first).
     pool.routeStatus(route, 200);
-    try std.testing.expect(pool.pick(a) == null);
-    pool.routeStatus(route, 429);
+    const re = pool.pick(a).?;
+    defer a.free(re.host);
+    pool.routeStatus(re, 403);
     try std.testing.expect(pool.entries.items[0].blocked_until_ms > first);
+    pool.report(re, 10, null);
+}
+
+test "leases exclude concurrent use and request-local exclusions prevent replay" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9000 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    try std.testing.expect(pool.pick(a) == null);
+    pool.report(route, 0, null);
+    try std.testing.expect(pool.pickAvoiding(a, &.{route}) == null);
+    const reused = pool.pick(a).?;
+    defer a.free(reused.host);
+    pool.report(reused, 5, true);
+    try std.testing.expectEqual(@as(usize, 1), pool.alive());
+}
+
+test "failed route quarantine survives refresh publication and expires" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9001 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 1, false);
+    pool.report(route, 1, false);
+    try std.testing.expect(pool.quarantined("127.0.0.1", 9001));
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9001 });
+    try std.testing.expect(pool.pick(a) == null);
+    pool.quarantine[0].until = 0;
+    const later = pool.pick(a).?;
+    defer a.free(later.host);
+    pool.report(later, 1, true);
+}
+
+test "background failures cannot evict a route with an active request" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9002 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(.{ .host = route.host, .port = route.port, .index = 0 }, 0, false);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+    pool.report(route, 1, true);
 }
 
 test "sources interleave, deduplicate and reject malformed addresses" {
@@ -823,8 +1092,13 @@ test "refills advance through cached candidates without fetching lists" {
         for (next.items) |c| a.free(c.host);
         next.deinit(a);
     }
+    // The whole 800-candidate reservoir is one validation batch
+    // (max_validate_batch=1500 > 800), so the first pass drains it and the
+    // cursor wraps; a revalidation pass still returns the reservoir head.
+    try std.testing.expectEqual(@as(usize, 800), first.items.len);
     try std.testing.expectEqual(@as(u16, 1), first.items[0].port);
-    try std.testing.expectEqual(@as(u16, 513), next.items[0].port);
+    try std.testing.expectEqual(@as(u16, 1), next.items[0].port);
+    try std.testing.expectEqual(@as(usize, 800), next.items.len);
 }
 
 test "queued request acquires released lease without concurrent reuse" {

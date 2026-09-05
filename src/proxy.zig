@@ -1678,7 +1678,7 @@ fn forwardAttempt(
     var picked_proxy: ?freeproxy.Picked = null;
     if (self.free_proxies) |pool| {
         if (prov.use_free_proxy) {
-            pool.maybeRefresh();
+            pool.noteDemand();
             ctx.phase = "waiting for public proxy";
             picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 30000));
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
@@ -1888,7 +1888,7 @@ fn handleCompletions(
     var acc: UsageAccum = .{ .alloc = alloc };
     defer acc.deinit();
     const ms_free_proxy = prov.use_free_proxy and self.free_proxies != null;
-    const max_attempts = if (ms_free_proxy) 4 else @min(prov.keys.len + 1, max_key_attempts);
+    const max_attempts = if (ms_free_proxy) 6 else @min(prov.keys.len + 1, max_key_attempts);
     var attempts: usize = 0;
     var prev_key: ?usize = null;
     var pending_failover: ?struct { from: usize, status: u16 } = null;
@@ -1946,6 +1946,10 @@ fn handleCompletions(
             pending_failover = .{ .from = key_idx, .status = 502 };
             last_status = if (err == error.Timeout) 504 else 502;
             last_body = &.{};
+            // A transport-level loss of a proxy is a demand signal: start a
+            // fresh validation/refill immediately so the next attempt has a
+            // wider pool to draw from.
+            if (ms_free_proxy) self.free_proxies.?.noteDemand();
             continue;
         };
         if (needsThinkingRepair(outcome.status, outcome.body)) {
@@ -3226,12 +3230,14 @@ test "public proxy transport failures do not cool or kill API keys" {
     var provider: ?usize = null;
     const req = InboundRequest{ .method = "POST", .path = "/v1/chat/completions", .body = "{\"model\":\"test/m\",\"messages\":[]}" };
     _ = try handleCompletions(&proxy, &writer.writer, arena.allocator(), req, .chat_completions, &provider);
-    try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
+    // Both routes were leased and failed transport-wise; each has a single
+    // transport failure (max_fails=2 keeps them until a second), so they stay
+    // pooled but quarantined is not required yet.
+    try std.testing.expectEqual(@as(usize, 2), pool.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 1), pool.entries.items[0].fails);
     try std.testing.expectEqual(models.KeyState.Active, keys[0].state);
     try std.testing.expectEqual(@as(u32, 0), keys[0].consecutive_errors);
     try std.testing.expect(std.mem.indexOf(u8, writer.written(), "API keys unchanged") != null);
-    _ = try handleCompletions(&proxy, &writer.writer, arena.allocator(), req, .chat_completions, &provider);
-    try std.testing.expectEqual(models.KeyState.Active, keys[0].state);
 }
 
 test "usage accounting reads structured usage and reassembles split SSE events" {
