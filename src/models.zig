@@ -27,7 +27,7 @@ const Allocator = std.mem.Allocator;
 
 pub const default_port: u16 = 54321;
 pub const default_cooldown_secs: u64 = 60;
-pub const default_timeout_ms: u32 = 30_000;
+pub const default_timeout_ms: u32 = 120_000;
 
 pub const opencode_display_name: []const u8 = "OpenCode Zen";
 pub const opencode_base_url: []const u8 = "https://opencode.ai/zen/v1/";

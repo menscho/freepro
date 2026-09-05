@@ -20,7 +20,7 @@ parser.add_argument('--config', required=True)
 parser.add_argument('--model', required=True)
 parser.add_argument('--requests', type=int, default=100)
 parser.add_argument('--concurrency', type=int, default=100)
-parser.add_argument('--timeout-ms', type=int, default=30000)
+parser.add_argument('--timeout-ms', type=int, default=120000)
 parser.add_argument('--ready', type=int, default=128)
 args = parser.parse_args()
 if not args.live:

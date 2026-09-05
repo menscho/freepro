@@ -156,4 +156,6 @@ scripts/           Integration checks and release packaging
 
 `python scripts/verify_live_load.py --live --binary PATH_TO_GUI --config PATH_TO_CONFIG --model oc/muse-spark-1.3-contributor-free --requests 100 --concurrency 100`
 
-This sends real model requests through public proxies using an isolated profile. It leaves the original configuration unchanged and reports HTTP status counts, nonempty completions, latency percentiles, and previously successful route capacity. The default request budget is 30 seconds; `--timeout-ms` changes the test budget. Transport validation does not establish how much model quota an IP has left.
+This sends real model requests through public proxies using an isolated profile. It leaves the original configuration unchanged and reports HTTP status counts, nonempty completions, latency percentiles, and previously successful route capacity. The default request budget is 120 seconds; `--timeout-ms` changes the test budget. Transport validation does not establish how much model quota an IP has left.
+
+For 100 concurrent agents, use a 120-second request timeout in both freepro and the client. A live Muse Spark 1.3 test completed 100/100 nonempty responses in 60.83 seconds (median 28.59 seconds, p95 57.28 seconds); the same 30-second-budget test completed 60/100. These are observed runs on a changing public pool, not a guaranteed service level. New configurations default to 120 seconds; existing installations retain their saved timeout.
