@@ -19,7 +19,7 @@ pub const logger = @import("logger.zig");
 pub const netwin = if (builtin.os.tag == .windows) @import("netwin.zig") else struct {};
 pub const ui = @import("ui.zig");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 13 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 14 };
 
 test {
     std.testing.refAllDecls(@This());

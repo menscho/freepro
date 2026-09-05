@@ -485,27 +485,39 @@ pub const Pool = struct {
     /// Origin status verdict on a real request (2xx or an origin error code).
     /// IMPORTANT: this NEVER changes a proxy's score or deletes it. An origin
     /// 429/403 says the ORIGIN is rate-limiting, not that the proxy is dead.
-    /// The only effects: a 2xx marks the route preferred; a non-2xx cools the
-    /// route briefly so the next request tries a different egress first.
+    /// Crucially, the origin rate-limits by EGRESS IP, so a 429 through one
+    /// proxy means every proxy behind the same IP is burned too. We cool ALL
+    /// entries sharing that IP for a longer window, so the picker moves on to
+    /// egress IPs the origin actually accepts. A 2xx unblocks the IP again.
     pub fn routeStatus(self: *Pool, picked: Picked, status: u16) void {
         self.mu.lock();
         defer self.mu.unlock();
-        const index = for (self.entries.items, 0..) |item, i| {
-            if (item.port == picked.port and std.mem.eql(u8, item.host, picked.host)) break i;
-        } else return;
-        const e = &self.entries.items[index];
+        const at = self.now();
         if (status >= 200 and status < 300) {
-            e.preferred = true;
-            e.validated_ms = self.now();
-            e.blocked_until_ms = 0;
+            // The origin accepted this egress IP: unblock every entry behind
+            // it and mark them preferred, so working IPs are reused.
+            for (self.entries.items) |*e2| {
+                if (e2.port == picked.port and std.mem.eql(u8, e2.host, picked.host)) {
+                    e2.preferred = true;
+                    e2.validated_ms = at;
+                    e2.blocked_until_ms = 0;
+                } else if (std.mem.eql(u8, e2.host, picked.host)) {
+                    e2.blocked_until_ms = 0;
+                }
+            }
             return;
         }
         if (status == 429 or status == 403 or status == 408 or status >= 502) {
-            // Cool only, never retire. 403/429 cool shortest (the origin is
-            // the cause); 5xx/408 a touch longer.
-            e.preferred = false;
-            const base_ms: i64 = if (status == 429 or status == 403) 8_000 else 20_000;
-            e.blocked_until_ms = @max(e.blocked_until_ms, self.now() + base_ms);
+            // Rate-limit/error verdict: cool every entry on this egress IP so
+            // the picker avoids all of them, not just this host:port. 429/403
+            // (origin rate-limit) cool longest - that IP is burned for the
+            // origin's window; 5xx/408 shorter.
+            const base_ms: i64 = if (status == 429 or status == 403) 60_000 else 20_000;
+            for (self.entries.items) |*e2| {
+                if (!std.mem.eql(u8, e2.host, picked.host)) continue;
+                e2.preferred = false;
+                e2.blocked_until_ms = @max(e2.blocked_until_ms, at + base_ms);
+            }
             return;
         }
     }
@@ -1162,6 +1174,36 @@ test "routeStatus cools but never deletes; only repeated transport fails drop" {
     pool.report(re, 0, false);
     pool.report(re, 0, false);
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
+}
+
+test "an origin 429 cools every proxy on the same egress IP, a 2xx unblocks them" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    // Three proxies, two on the same burned IP, one on a clean IP.
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "203.0.113.1"), .port = 8001 });
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "203.0.113.1"), .port = 8002 });
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "198.51.100.9"), .port = 8003 });
+    // A 429 through the first proxy must cool BOTH same-IP entries.
+    const r1 = pool.pick(a).?;
+    defer a.free(r1.host);
+    // pick picks lowest latency/first: all equal, so expect any; force the burned one via pickAvoiding the clean IP
+    // Simpler: call routeStatus on the burned host directly.
+    pool.report(r1, 0, null); // release
+    pool.routeStatus(.{ .host = "203.0.113.1", .port = 8001, .index = 0 }, 429);
+    var blocked: usize = 0;
+    for (pool.entries.items) |e| {
+        if (std.mem.eql(u8, e.host, "203.0.113.1") and e.blocked_until_ms > pool.now()) blocked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), blocked);
+    // The clean-IP entry is not blocked and is pickable.
+    try std.testing.expectEqual(@as(i64, 0), pool.entries.items[2].blocked_until_ms);
+    // A 2xx through the same IP unblocks both.
+    pool.routeStatus(.{ .host = "203.0.113.1", .port = 8001, .index = 0 }, 200);
+    for (pool.entries.items) |e| {
+        if (std.mem.eql(u8, e.host, "203.0.113.1")) try std.testing.expectEqual(@as(i64, 0), e.blocked_until_ms);
+    }
 }
 
 test "neutral probe failure drops only after repeated strikes; recovery helps" {
