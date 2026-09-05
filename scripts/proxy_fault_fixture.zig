@@ -5,6 +5,11 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const a = arena.allocator();
+    if (init.environ_map.get("TEST_NEUTRAL_URL")) |url| {
+        const ok = engine.freeproxy.checkNeutralTarget(init.io, url, 300);
+        try std.Io.File.stdout().writeStreamingAll(init.io, if (ok) "true" else "false");
+        return;
+    }
     if (init.environ_map.get("TEST_CATALOG_PROXY_PORT")) |port| {
         const ok = engine.freeproxy.timed(bool, init.io, 1500, engine.freeproxy.probeOriginOk, .{ init.io, "http://origin.invalid/v1/", "unused", "127.0.0.1", try std.fmt.parseInt(u16, port, 10) }) catch false;
         try std.Io.File.stdout().writeStreamingAll(init.io, if (ok) "true" else "false");

@@ -136,7 +136,7 @@ const list_sources = [_][]const u8{
 
 /// Neutral validation target: a tiny Google 204 endpoint. No model provider is
 /// ever the arbiter of a proxy's health, so origin rate-limits can never drain
-/// the pool. A 204 (or any 2xx) means "this proxy can reach the open internet
+/// the pool. The expected empty 204 means "this proxy can reach the open internet
 /// over HTTPS CONNECT + TLS".
 const probe_url = "https://www.gstatic.com/generate_204";
 
@@ -1029,9 +1029,8 @@ fn httpGet(pool: *Pool, alloc: Allocator, url: []const u8) ![]u8 {
 }
 
 /// One-shot HTTPS probe through CONNECT to the NEUTRAL target, with origin
-/// certificate validation. Returns true when the proxy reaches the open
-/// internet (2xx). Public so the request path can re-check a proxy on a
-/// 429/403 verdict to tell "origin rate-limit" from "dead proxy".
+/// certificate validation. Requires the neutral endpoint's expected empty 204.
+/// Callers must apply a deadline when using this low-level probe.
 pub fn probeNeutralOk(io: std.Io, host: []const u8, port: u16) bool {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1057,17 +1056,33 @@ pub fn probeNeutralOk(io: std.Io, host: []const u8, port: u16) bool {
     req.sendBodiless() catch return false;
     var redirect_buf: [512]u8 = undefined;
     const response = req.receiveHead(&redirect_buf) catch return false;
-    return @intFromEnum(response.head.status) / 100 == 2;
+    return neutralResponseOk(response.head);
 }
 
 /// Direct (no-proxy) check that the neutral validation target is reachable.
 /// When this is false the network/checker is down, so probe failures must NOT
 /// be treated as proxy deaths (that used to mass-evict the whole pool).
 pub fn neutralTargetUp(io: std.Io) bool {
+    return checkNeutralTarget(io, probe_url, max_latency_ms);
+}
+
+/// Bound the entire direct checker request, including connect and headers.
+/// The URL parameter allows deterministic local fault tests without public traffic.
+pub fn checkNeutralTarget(io: std.Io, url: []const u8, deadline_ms: u64) bool {
+    return timed(bool, io, deadline_ms, checkNeutralTargetInner, .{ io, url }) catch false;
+}
+
+fn neutralResponseOk(head: HttpClient.Response.Head) bool {
+    return head.status == .no_content and
+        (head.content_length == null or head.content_length.? == 0) and
+        head.transfer_encoding == .none;
+}
+
+fn checkNeutralTargetInner(io: std.Io, url: []const u8) bool {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const uri = std.Uri.parse(probe_url) catch return false;
+    const uri = std.Uri.parse(url) catch return false;
     var client: HttpClient = .{ .allocator = arena, .io = io };
     defer client.deinit();
     var req = client.request(.GET, uri, .{
@@ -1078,7 +1093,7 @@ pub fn neutralTargetUp(io: std.Io) bool {
     req.sendBodiless() catch return false;
     var redirect_buf: [512]u8 = undefined;
     const response = req.receiveHead(&redirect_buf) catch return false;
-    return @intFromEnum(response.head.status) / 100 == 2;
+    return neutralResponseOk(response.head);
 }
 
 /// Lightweight anonymous catalog check. Never generate model traffic during
@@ -1156,7 +1171,7 @@ fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     try req.sendBodiless();
     var redirect_buf: [512]u8 = undefined;
     const response = try req.receiveHead(&redirect_buf);
-    if (@intFromEnum(response.head.status) / 100 != 2) return error.BadStatus;
+    if (!neutralResponseOk(response.head)) return error.BadStatus;
 }
 
 fn timeoutTask(io: std.Io, ms: u64) std.Io.Cancelable!void {

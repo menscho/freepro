@@ -15,6 +15,33 @@ def head(c):
   if not part:return data
   data+=part
  return data
+
+class NeutralTarget:
+ def __init__(self,mode):
+  self.mode=mode;self.stop=threading.Event();self.seen=False
+  self.server=socket.socket();self.server.bind(('127.0.0.1',0));self.server.listen();self.server.settimeout(.1)
+  self.url=f'http://127.0.0.1:{self.server.getsockname()[1]}/generate_204'
+  self.thread=threading.Thread(target=self.serve,daemon=True);self.thread.start()
+ def serve(self):
+  try:
+   while not self.stop.is_set():
+    try:c,_=self.server.accept();break
+    except socket.timeout:continue
+   else:return
+   with c:
+    c.settimeout(2);self.seen=head(c).startswith(b'GET /generate_204 HTTP/1.1')
+    if self.mode=='stall':self.stop.wait(5);return
+    responses={
+     'ok':b'HTTP/1.1 204 No Content\r\n\r\n',
+     'html':b'HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n<html>no</html>',
+     'redirect':b'HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\n\r\n',
+     'bad-length':b'HTTP/1.1 204 No Content\r\nContent-Length: 99\r\n\r\n',
+     'chunked':b'HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n',
+    }
+    c.sendall(responses[self.mode])
+  except OSError:pass
+ def close(self):
+  self.stop.set();self.thread.join(timeout=3);self.server.close()
 class Hop:
  def __init__(self,mode,host="127.0.0.1"):
   self.mode=mode;self.seen=0;self.stop=threading.Event();self.server=socket.socket()
@@ -105,6 +132,18 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False,pretrip=Fal
   if proc.poll() is None:proc.kill();proc.wait()
   for h in hops:h.close()
 if __name__=='__main__':
+ for mode in ['ok','html','redirect','bad-length','chunked','stall']:
+  target=NeutralTarget(mode)
+  try:
+   started=time.monotonic()
+   result=subprocess.run([str(binary)],env=dict(os.environ,TEST_NEUTRAL_URL=target.url),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=3,check=True)
+   elapsed=time.monotonic()-started
+   assert target.seen,(mode,'checker never reached fixture')
+   assert result.stdout==(b'true' if mode=='ok' else b'false'),(mode,result.stdout,result.stderr)
+   assert elapsed<2,(mode,elapsed)
+  finally:target.close()
+ print('PASS neutral checker deadline releases a stalled response; only the expected empty 204 passes')
+
  for mode in ['catalog-ok','catalog-404','catalog-html','catalog-truncated']:
   hop=Hop(mode)
   try:
