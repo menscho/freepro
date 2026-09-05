@@ -177,12 +177,101 @@ pub const Pool = struct {
     /// for capacity; lets the fetch kick in earlier than the next 5-min list
     /// cycle would. Cleared when a refresh pass starts.
     demand_high: bool = false,
-    /// Circuit breaker (see the consts at the top of the file).
-    origin_breaker_until_ms: i64 = 0,
-    origin_breaker_strikes: u8 = 0,
-    last_breaker_host: [15]u8 = @splat(0),
-    last_breaker_host_len: usize = 0,
-    last_breaker_at_ms: i64 = 0,
+    /// Circuit breaker, keyed per provider prefix (see the consts at the top
+    /// of the file). One provider rate-limiting through many egresses pauses
+    /// only ITS OWN proxied requests; other providers keep flowing.
+    origin_breaker_until_ms: [8]i64 = @splat(0),
+    origin_breaker_strikes: [8]u8 = @splat(0),
+    last_breaker_host: [8][15]u8 = @splat(@splat(0)),
+    last_breaker_host_len: [8]usize = @splat(0),
+    last_breaker_at_ms: [8]i64 = @splat(0),
+
+    fn breakerSlot(prefix: []const u8) usize {
+        // A tiny stable hash of the provider prefix into a small slot table.
+        var h: u32 = 2166136261;
+        for (prefix) |c| h = (h ^ c) *% 16777619;
+        return h % 8;
+    }
+
+    /// Called on every 429/403 verdict for `prefix`'s origin. Returns true
+    /// when the request should stop immediately (the origin is throttling
+    /// this account through many egresses); that provider's breaker then
+    /// trips open briefly. This NEVER deletes or retires a route: the
+    /// origin's mood is not the proxy's health.
+    pub fn noteOriginThrottle(self: *Pool, prefix: []const u8, host: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const s = breakerSlot(prefix);
+        const at = self.now();
+        if (at < self.origin_breaker_until_ms[s]) return true;
+        const first_seen = self.last_breaker_host_len[s] == 0;
+        const same_host = std.mem.eql(u8, self.last_breaker_host[s][0..self.last_breaker_host_len[s]], host);
+        const window_expired = at - self.last_breaker_at_ms[s] > origin_breaker_window_ms;
+        if (!first_seen and same_host and !window_expired) return false;
+        if (first_seen) {
+            self.last_breaker_at_ms[s] = at;
+            self.origin_breaker_strikes[s] = 0;
+            if (host.len <= 15) {
+                self.last_breaker_host_len[s] = host.len;
+                @memcpy(self.last_breaker_host[s][0..host.len], host);
+            }
+            return false;
+        }
+        const strikes: u8 = if (window_expired) 1 else self.origin_breaker_strikes[s] + 1;
+        self.origin_breaker_strikes[s] = strikes;
+        self.last_breaker_at_ms[s] = at;
+        if (host.len <= 15) {
+            self.last_breaker_host_len[s] = host.len;
+            @memcpy(self.last_breaker_host[s][0..host.len], host);
+        }
+        if (strikes >= origin_breaker_threshold) {
+            self.origin_breaker_until_ms[s] = at + origin_breaker_open_ms;
+            self.origin_breaker_strikes[s] = 0;
+            self.logInfo("proxy pool: provider {s} throttled through {d} distinct proxies; pausing its proxied attempts briefly", .{ prefix, origin_breaker_threshold });
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether `prefix`'s origin-throttle breaker is currently open.
+    pub fn originThrottleOpen(self: *Pool, prefix: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.now() < self.origin_breaker_until_ms[breakerSlot(prefix)];
+    }
+
+    /// A successful request for `prefix` through a proxy clears its breaker.
+    pub fn clearOriginThrottle(self: *Pool, prefix: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const s = breakerSlot(prefix);
+        self.origin_breaker_until_ms[s] = 0;
+        self.origin_breaker_strikes[s] = 0;
+        self.last_breaker_at_ms[s] = self.now();
+    }
+
+    /// Record that the origin returned 429/403 for `host` through `prefix`
+    /// and remember the route so it is not immediately re-picked for the same
+    /// origin within the cooldown. Returns the ms to wait (from the origin's
+    /// Retry-After when available) for the caller to surface.
+    pub fn noteOriginThrottleRoute(self: *Pool, prefix: []const u8, host: []const u8, port: u16, retry_after_ms: u64) i64 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const s = breakerSlot(prefix);
+        // Cool THIS route for that origin so we do not burn it again right
+        // away; but keep the proxy itself healthy (the origin is the cause).
+        const idx = for (self.entries.items, 0..) |item, i| {
+            if (item.port == port and std.mem.eql(u8, item.host, host)) break i;
+        } else return 0;
+        const e = &self.entries.items[idx];
+        const cool_ms: i64 = if (retry_after_ms != 0) @min(@as(i64, @intCast(retry_after_ms)), 60_000) else 8_000;
+        e.blocked_until_ms = @max(e.blocked_until_ms, self.now() + cool_ms);
+        // Extend the provider breaker by at least the cooldown.
+        if (self.origin_breaker_until_ms[s] != 0) {
+            self.origin_breaker_until_ms[s] = @max(self.origin_breaker_until_ms[s], self.now() + cool_ms);
+        }
+        return cool_ms;
+    }
 
     pub fn init(alloc: Allocator, io: std.Io) Pool {
         return .{ .alloc = alloc, .io = io };
@@ -212,63 +301,6 @@ pub const Pool = struct {
         const t = nowMs();
         if (t == 0) return 1; // nowMs()==0 would make every staleness check false
         return t;
-    }
-
-    // -- origin-throttle circuit breaker ------------------------------------
-
-    /// Called on every 429/403 verdict. Returns true when the request should
-    /// stop immediately (the origin is throttling this account through many
-    /// egresses); the pool then trips open briefly. This NEVER deletes or
-    /// retires a route: the origin's mood is not the proxy's health.
-    pub fn noteOriginThrottle(self: *Pool, host: []const u8) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        const at = self.now();
-        if (at < self.origin_breaker_until_ms) return true;
-        const first_seen = self.last_breaker_host_len == 0;
-        const same_host = std.mem.eql(u8, self.last_breaker_host[0..self.last_breaker_host_len], host);
-        const window_expired = at - self.last_breaker_at_ms > origin_breaker_window_ms;
-        if (!first_seen and same_host and !window_expired) return false;
-        if (first_seen) {
-            // Baseline: record this host without counting it as evidence yet.
-            self.last_breaker_at_ms = at;
-            self.origin_breaker_strikes = 0;
-            if (host.len <= 15) {
-                self.last_breaker_host_len = host.len;
-                @memcpy(self.last_breaker_host[0..host.len], host);
-            }
-            return false;
-        }
-        const strikes: u8 = if (window_expired) 1 else self.origin_breaker_strikes + 1;
-        self.origin_breaker_strikes = strikes;
-        self.last_breaker_at_ms = at;
-        if (host.len <= 15) {
-            self.last_breaker_host_len = host.len;
-            @memcpy(self.last_breaker_host[0..host.len], host);
-        }
-        if (strikes >= origin_breaker_threshold) {
-            self.origin_breaker_until_ms = at + origin_breaker_open_ms;
-            self.origin_breaker_strikes = 0;
-            self.logInfo("proxy pool: origin throttled through {d} distinct proxies; pausing proxied attempts briefly", .{origin_breaker_threshold});
-            return true;
-        }
-        return false;
-    }
-
-    /// Whether the origin-throttle breaker is currently open.
-    pub fn originThrottleOpen(self: *Pool) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        return self.now() < self.origin_breaker_until_ms;
-    }
-
-    /// A successful request through a proxy clears the breaker immediately.
-    pub fn clearOriginThrottle(self: *Pool) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.origin_breaker_until_ms = 0;
-        self.origin_breaker_strikes = 0;
-        self.last_breaker_at_ms = self.now();
     }
 
     // -- selection -----------------------------------------------------------
@@ -494,6 +526,12 @@ pub const Pool = struct {
             _ = self.entries.orderedRemove(index);
             self.alloc.free(h);
         }
+    }
+
+    /// Called when a request got a 429/403 AND the same proxy failed a neutral
+    /// probe: the proxy itself is dead/burned, so drop it (proxy_pool score).
+    pub fn reportProxyDead(self: *Pool, host: []const u8, port: u16) void {
+        self.reportProbeFailure(host, port);
     }
 
     // -- diagnostics ----------------------------------------------------------
@@ -887,7 +925,37 @@ fn httpGet(pool: *Pool, alloc: Allocator, url: []const u8) ![]u8 {
 }
 
 /// One-shot HTTPS probe through CONNECT to the NEUTRAL target, with origin
-/// certificate validation. A 2xx means the proxy reaches the open internet.
+/// certificate validation. Returns true when the proxy reaches the open
+/// internet (2xx). Public so the request path can re-check a proxy on a
+/// 429/403 verdict to tell "origin rate-limit" from "dead proxy".
+pub fn probeNeutralOk(io: std.Io, host: []const u8, port: u16) bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const proxy = arena.create(HttpClient.Proxy) catch return false;
+    proxy.* = .{
+        .protocol = .plain,
+        .host = std.Io.net.HostName.init(arena.dupe(u8, host) catch return false) catch return false,
+        .port = port,
+        .authorization = null,
+        .supports_connect = true,
+    };
+    const uri = std.Uri.parse(probe_url) catch return false;
+    var client: HttpClient = .{ .allocator = arena, .io = io };
+    defer client.deinit();
+    client.http_proxy = proxy;
+    client.https_proxy = proxy;
+    var req = client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+    }) catch return false;
+    defer req.deinit();
+    req.sendBodiless() catch return false;
+    var redirect_buf: [512]u8 = undefined;
+    const response = req.receiveHead(&redirect_buf) catch return false;
+    return @intFromEnum(response.head.status) / 100 == 2;
+}
+
 fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     var arena_state = std.heap.ArenaAllocator.init(pool.alloc);
     defer arena_state.deinit();
@@ -1099,30 +1167,52 @@ test "neutral probe failure drops only after repeated strikes; recovery helps" {
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
 }
 
-test "origin-throttle breaker trips on distinct egresses and opens the pool" {
+test "origin-throttle breaker trips per-provider on distinct egresses and opens" {
     const a = std.testing.allocator;
     var pool = Pool.init(a, std.testing.io);
     defer pool.deinit();
     pool.stopping = true;
 
     for (0..10) |_| {
-        try std.testing.expect(!pool.noteOriginThrottle("10.0.0.1"));
+        try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.1"));
     }
-    try std.testing.expect(!pool.originThrottleOpen());
+    try std.testing.expect(!pool.originThrottleOpen("p1/"));
 
-    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.2"));
-    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.3"));
-    try std.testing.expect(pool.noteOriginThrottle("10.0.0.4"));
-    try std.testing.expect(pool.originThrottleOpen());
+    try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.2"));
+    try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.3"));
+    try std.testing.expect(pool.noteOriginThrottle("p1/", "10.0.0.4"));
+    try std.testing.expect(pool.originThrottleOpen("p1/"));
 
-    pool.clearOriginThrottle();
-    try std.testing.expect(!pool.originThrottleOpen());
+    // A different provider is NOT paused by p1's throttle.
+    try std.testing.expect(!pool.originThrottleOpen("p2/"));
 
-    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.5"));
-    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.6"));
-    try std.testing.expect(pool.noteOriginThrottle("10.0.0.7"));
-    pool.origin_breaker_until_ms = 0;
-    try std.testing.expect(!pool.originThrottleOpen());
+    pool.clearOriginThrottle("p1/");
+    try std.testing.expect(!pool.originThrottleOpen("p1/"));
+
+    try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.5"));
+    try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.6"));
+    try std.testing.expect(pool.noteOriginThrottle("p1/", "10.0.0.7"));
+    pool.origin_breaker_until_ms[Pool.breakerSlot("p1/")] = 0;
+    try std.testing.expect(!pool.originThrottleOpen("p1/"));
+}
+
+test "noteOriginThrottleRoute cools the route and honors retry-after" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 6001 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 0, null); // release the lease
+    // With Retry-After 5s, the route is cooled ~5s and never deleted.
+    const cool = pool.noteOriginThrottleRoute("p/", "127.0.0.1", 6001, 5000);
+    try std.testing.expect(cool >= 5000);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+    try std.testing.expect(pool.entries.items[0].blocked_until_ms > pool.now());
+    // Origin 429s never drop the route.
+    for (0..20) |_| pool.routeStatus(route, 429);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
 }
 
 test "sources interleave, deduplicate and reject malformed addresses" {

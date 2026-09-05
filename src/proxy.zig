@@ -962,6 +962,20 @@ fn sendStatus(writer: *std.Io.Writer, status: u16, message: []const u8) !void {
     try sendJson(writer, status, body);
 }
 
+fn sendStatusRetryAfter(writer: *std.Io.Writer, status: u16, message: []const u8, retry_after_s: u64) !void {
+    var buf: [512]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &buf,
+        "{{\"error\":{{\"message\":\"{s}\",\"type\":\"proxy_error\",\"code\":{d},\"retry_after\":{d}}}}}",
+        .{ message, status, retry_after_s },
+    ) catch "{\"error\":{\"message\":\"proxy error\",\"type\":\"proxy_error\"}}";
+    try writer.print(
+        "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nRetry-After: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, reasonPhrase(status), body.len, retry_after_s },
+    );
+    try writer.writeAll(body);
+}
+
 fn sendSseHead(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "HTTP/1.1 200 OK\r\n" ++
@@ -1260,7 +1274,25 @@ const AttemptOutcome = struct {
     /// for origin-throttle attribution). Empty when direct.
     proxy_host: []const u8 = "",
     proxy_port: u16 = 0,
+    /// Retry-After from the upstream (ms), 0 when absent.
+    retry_after_ms: u64 = 0,
 };
+
+/// Best-effort Retry-After parse from an upstream response head (seconds).
+/// Falls back to 0 when absent/malformed.
+fn parseRetryAfter(head: anytype) u64 {
+    // std.http response heads expose headers via iterateHeaders; search for
+    // "retry-after" case-insensitively.
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
+            const v = std.mem.trim(u8, h.value, " \t");
+            if (std.fmt.parseInt(u64, v, 10)) |secs| return secs * 1000 else |_| {}
+            return 0;
+        }
+    }
+    return 0;
+}
 
 fn headerNameEq(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
@@ -1683,10 +1715,11 @@ fn forwardAttempt(
     var picked_proxy: ?freeproxy.Picked = null;
     if (self.free_proxies) |pool| {
         if (prov.use_free_proxy) {
-            // The origin-throttle breaker is open: the origin just rejected
-            // several distinct egresses, so a new attempt would only burn
-            // time against the same wall. Fail fast with the real verdict.
-            if (pool.originThrottleOpen()) return error.OriginThrottled;
+            // The origin-throttle breaker for THIS provider is open: the
+            // origin just rejected several distinct egresses, so a new
+            // attempt would only burn time against the same wall. Fail fast
+            // with the real verdict.
+            if (pool.originThrottleOpen(prov.prefix)) return error.OriginThrottled;
             pool.noteDemand();
             ctx.phase = "waiting for public proxy";
             picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 30000));
@@ -1764,6 +1797,9 @@ fn forwardAttempt(
         try req.receiveHead(&redirect_buf);
 
     const status: u16 = @intFromEnum(response.head.status);
+    // Read Retry-After now while the head is valid (before body consumption
+    // can invalidate its string slices).
+    const retry_after_ms = parseRetryAfter(response.head);
     if (picked_proxy) |picked| {
         if (!models.isHealthyStatus(status)) self.free_proxies.?.routeStatus(picked, status);
         if (self.logger) |l| l.info("public proxy {s}:{d}: response headers {d} (body pending)", .{ picked.host, picked.port, status });
@@ -1847,18 +1883,18 @@ fn forwardAttempt(
             } else sendJson(writer, status, resp_body) catch return error.ClientDisconnected;
         }
         if (picked_proxy) |picked| if (self.logger) |l| l.info("public proxy {s}:{d}: completed HTTP {d}", .{ picked.host, picked.port, status });
-        return .{ .status = status, .body = &.{}, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0 };
+        return .{ .status = status, .body = &.{}, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0, .retry_after_ms = retry_after_ms };
     }
 
     const err_body = (if (picked_proxy != null)
         socketTimed([]u8, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, 8000), bufferUpstreamBody, .{ reader, alloc, max_upstream_error_bytes })
     else
         bufferUpstreamBody(reader, alloc, max_upstream_error_bytes)) catch |err| {
-        if (err == ProxyError.BodyTooLarge) return .{ .status = status, .body = &.{}, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0 };
+        if (err == ProxyError.BodyTooLarge) return .{ .status = status, .body = &.{}, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0, .retry_after_ms = retry_after_ms };
         return err;
     };
     if (proxied) |*pr| pr.ok = !headerValueHas(ctype, "text/html") and status != 407;
-    return .{ .status = status, .body = err_body, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0 };
+    return .{ .status = status, .body = err_body, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0, .retry_after_ms = retry_after_ms };
 }
 
 // -- POST /v1/chat/completions + /v1/completions -------------------------------
@@ -1993,7 +2029,7 @@ fn handleCompletions(
         if (!ms_free_proxy or models.isHealthyStatus(outcome.status)) self.reportKey(p_idx, key_idx, outcome.status);
 
         if (models.isHealthyStatus(outcome.status)) {
-            if (ms_free_proxy) self.free_proxies.?.clearOriginThrottle();
+            if (ms_free_proxy) self.free_proxies.?.clearOriginThrottle(prov.prefix);
             if (self.metrics) |m| m.recordModelUsage(ms.model, acc.input, acc.output, acc.cached, usageToday());
             return outcome.status; // already relayed
         }
@@ -2009,17 +2045,33 @@ fn handleCompletions(
                     std.mem.indexOf(u8, outcome.body[0..@min(outcome.body.len, 256)], "<!DOCTYPE") != null);
             if (shouldFailoverStatus(outcome.status) or looks_html) {
                 if (outcome.status == 429 or outcome.status == 403) {
-                    // The origin throttled this egress. If it has throttled
-                    // several distinct egresses in a row, stop immediately and
-                    // report the real verdict instead of burning more attempts
-                    // (and retiring more of the pool).
+                    // The origin throttled this egress. Distinguish "the
+                    // proxy is dead" from "the origin is rate-limiting": a
+                    // quick neutral probe of the SAME proxy tells us which.
                     const pool = self.free_proxies.?;
                     const host = if (outcome.proxy_host.len != 0) outcome.proxy_host else ctx.routes.items[ctx.routes.items.len - 1].host;
-                    if (pool.noteOriginThrottle(host)) {
-                        if (self.metrics) |m| m.noteFailover();
-                        if (self.logger) |l| l.warn("public proxy route failed ({d}); origin throttling through many egresses — pausing proxied attempts", .{outcome.status});
-                        try sendStatus(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly");
-                        return 429;
+                    const port = if (outcome.proxy_port != 0) outcome.proxy_port else ctx.routes.items[ctx.routes.items.len - 1].port;
+                    // Short synchronous neutral probe of the same proxy.
+                    const probe_ok = freeproxy.timed(bool, self.io, 3000, freeproxy.probeNeutralOk, .{ self.io, host, port }) catch false;
+                    if (probe_ok) {
+                        // The proxy is fine; the ORIGIN is the cause. Cool
+                        // this route for this provider, honor Retry-After, and
+                        // (if several distinct egresses throttled) trip this
+                        // provider's breaker.
+                        const retry_ms = outcome.retry_after_ms;
+                        const cool_ms = pool.noteOriginThrottleRoute(prov.prefix, host, port, retry_ms);
+                        if (pool.noteOriginThrottle(prov.prefix, host)) {
+                            if (self.metrics) |m| m.noteFailover();
+                            if (self.logger) |l| l.warn("public proxy route failed ({d}); origin throttling through many egresses — pausing this provider's proxied attempts", .{outcome.status});
+                            const wait_ms: u64 = if (retry_ms != 0) retry_ms else @intCast(@max(cool_ms, 1000));
+                            try sendStatusRetryAfter(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly", @max(1, wait_ms / 1000));
+                            return 429;
+                        }
+                    } else {
+                        // The proxy itself is dead/burned: score it down via
+                        // the transport-failure path so it drops.
+                        if (self.logger) |l| l.info("public proxy {s}:{d} returned {d} AND failed the neutral probe; treating as dead", .{ host, port, outcome.status });
+                        pool.reportProxyDead(host, port);
                     }
                 }
                 if (self.metrics) |m| m.noteFailover();
