@@ -1679,7 +1679,10 @@ fn forwardAttempt(
     ctx: *AttemptContext,
 ) !AttemptOutcome {
     const prov = &self.config.providers[provider_idx];
-    const key_material = prov.keys[key_idx].key;
+    // Anonymous sentinel: providers with no keys and no authorization header
+    // (e.g. the OpenCode Zen free tier) forward without any auth.
+    const anon = key_idx == std.math.maxInt(usize);
+    const key_material = if (anon) "" else prov.keys[key_idx].key;
 
     // Responses-wire providers: translate the chat body and target /responses.
     var wire_body: []const u8 = try providerBody(alloc, prov, body);
@@ -1920,7 +1923,11 @@ fn handleCompletions(
     provider_out.* = p_idx;
 
     const prov = &self.config.providers[p_idx];
-    if (prov.keys.len == 0) {
+    // Keyless-anonymous providers (no keys AND no authorization header) are
+    // forwarded with no auth at all (e.g. the OpenCode Zen free tier). The
+    // anonymous sentinel is not a real key.
+    const anon_key = prov.keys.len == 0 and prov.findHeader("authorization") == null;
+    if (prov.keys.len == 0 and !anon_key) {
         try sendStatus(writer, 503, "provider has no API keys configured");
         return 503;
     }
@@ -1948,8 +1955,8 @@ fn handleCompletions(
             last_body = &.{};
             break;
         }
-        const key_idx = self.pickKey(p_idx) orelse break;
-        if (!ms_free_proxy and prev_key != null and prev_key.? == key_idx and attempts > 0) break; // rotator stalled; avoid hammering
+        const key_idx = if (anon_key) std.math.maxInt(usize) else (self.pickKey(p_idx) orelse break);
+        if (!anon_key and !ms_free_proxy and prev_key != null and prev_key.? == key_idx and attempts > 0) break; // rotator stalled; avoid hammering
         prev_key = key_idx;
         tried_any = true;
 
@@ -1989,10 +1996,10 @@ fn handleCompletions(
                 try sendStatus(writer, 503, "no eligible public proxy became available within the queue budget, or the queue is full (API keys unchanged)");
                 return 503;
             }
-            if (!ms_free_proxy) self.reportKey(p_idx, key_idx, null);
+            if (!ms_free_proxy and !anon_key) self.reportKey(p_idx, key_idx, null);
             if (self.metrics) |m| m.noteFailover();
             if (self.logger) |l| {
-                if (ms_free_proxy) l.warn("public proxy failed during {s}: {s} (API key unchanged)", .{ ctx.phase, @errorName(err) }) else l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
+                if (ms_free_proxy) l.warn("public proxy failed during {s}: {s} (API key unchanged)", .{ ctx.phase, @errorName(err) }) else if (anon_key) l.warn("anonymous upstream failed during {s}: {s}", .{ ctx.phase, @errorName(err) }) else l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
             }
             pending_failover = .{ .from = key_idx, .status = 502 };
             last_status = if (err == error.Timeout) 504 else 502;
@@ -2026,7 +2033,7 @@ fn handleCompletions(
             return outcome.status;
         }
 
-        if (!ms_free_proxy or models.isHealthyStatus(outcome.status)) self.reportKey(p_idx, key_idx, outcome.status);
+        if ((!ms_free_proxy and !anon_key) or models.isHealthyStatus(outcome.status)) self.reportKey(p_idx, key_idx, outcome.status);
 
         if (models.isHealthyStatus(outcome.status)) {
             if (ms_free_proxy) self.free_proxies.?.clearOriginThrottle(prov.prefix);
