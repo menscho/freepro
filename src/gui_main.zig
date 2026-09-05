@@ -187,6 +187,9 @@ fn loadConfigOrDefaults(alloc: std.mem.Allocator, path: []const u8) !models.Prox
         }
     }
     g.log.info("loaded config from {s}", .{path});
+    if (config_mod.migrateLegacyDefaultPort(&cfg)) {
+        g.log.info("port migrated from the pre-0.1.4 default {d} to {d}", .{ config_mod.LEGACY_DEFAULT_PORT, cfg.port });
+    }
     return cfg;
 }
 
@@ -303,11 +306,11 @@ fn startProxy() bool {
         return true;
     }
     g.server.?.start() catch |err| {
-        g.log.err("proxy failed to bind 127.0.0.1:{d}: {s}", .{ g.config.port, @errorName(err) });
+        g.log.err("proxy failed to bind 127.0.0.1:{d} or the {d} ports above it: {s}", .{ g.config.port, proxy_mod.port_scan_span, @errorName(err) });
         return false;
     };
     g.proxy_started.store(true, .release);
-    g.log.info("proxy listening on 127.0.0.1:{d}", .{g.config.port});
+    g.log.info("proxy listening on 127.0.0.1:{d}", .{g.server.?.boundPort()});
     return true;
 }
 
@@ -325,8 +328,16 @@ fn stopProxy() void {
 // Browser launcher (warn-only; the proxy keeps serving either way)
 // ---------------------------------------------------------------------------
 
+/// Dashboard/proxy URL. Once the listener is up this is the port it actually
+/// holds — start() falls back to a free port above the configured one — so the
+/// browser, the status line, and the quick-add base URL all agree with what is
+/// really serving. Before the first start it is the configured port.
 fn dashboardUrl(buf: []u8) []u8 {
-    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/", .{g.config.port}) catch buf[0..0];
+    var port = g.config.port;
+    if (g.server) |*s| {
+        if (s.isRunning()) port = s.boundPort();
+    }
+    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/", .{port}) catch buf[0..0];
 }
 
 /// Windows shell32: the OS-native URL launcher. Routed through

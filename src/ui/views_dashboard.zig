@@ -170,7 +170,7 @@ pub const DashboardView = struct {
     spark: [spark_width]f32 = [_]f32{0} ** spark_width,
     spark_len: usize = 0,
     server_running: bool = false,
-    port: u16 = 8080,
+    port: u16 = models.default_port,
     prev_total: u64 = 0,
     served_delta: u64 = 0,
 

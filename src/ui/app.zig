@@ -30,7 +30,7 @@
 //        cooldown_until, consecutive_errors, enabled }
 //   Provider{ display_name, base_url, prefix, description, keys, headers }
 //   CustomHeader{ key, value }
-//   ProxyConfig{ port (default 8080), providers (slice or ArrayList),
+//   ProxyConfig{ port (default 54321), providers (slice or ArrayList),
 //                auto_start, cooldown_secs (default 60), timeout_ms }
 // Field access below goes through small duck-typed helpers so both a slice
 // and a std.ArrayList work for `providers`/`keys`, and key health is matched
@@ -40,7 +40,7 @@ const std = @import("std");
 const models = @import("../models.zig");
 
 pub const loopback: []const u8 = "127.0.0.1";
-pub const default_port: u16 = 8080;
+pub const default_port: u16 = 54321;
 pub const default_cooldown_secs: u64 = 60;
 
 /// Primary navigation tabs. Order here is the tab-bar order.
@@ -712,19 +712,19 @@ test "shell port text syncs, validates, and applies" {
     var app = testApp(t.allocator, &cfg);
     defer app.deinit();
 
-    try t.expectEqualStrings("8080", app.port_text[0..app.port_len]);
+    try t.expectEqualStrings("54321", app.port_text[0..app.port_len]);
     try t.expect(!app.port_error);
 
     @memcpy(app.port_text[0..3], "abc");
     app.port_len = 3;
     try t.expect(!app.applyPort());
     try t.expect(app.port_error);
-    try t.expectEqual(@as(u16, 8080), cfg.port);
+    try t.expectEqual(@as(u16, 54321), cfg.port);
 
     @memcpy(app.port_text[0..1], "0");
     app.port_len = 1;
     try t.expect(!app.applyPort());
-    try t.expectEqual(@as(u16, 8080), cfg.port);
+    try t.expectEqual(@as(u16, 54321), cfg.port);
 
     @memcpy(app.port_text[0..4], "9090");
     app.port_len = 4;
@@ -765,7 +765,7 @@ test "shell server toggle flips status with and without hooks" {
     // Healthy hook: start applies the port, stop runs on deinit.
     ctx.fail_start = false;
     try t.expectEqual(ServerStatus.running, app2.toggleServer());
-    try t.expectEqual(@as(u16, 8080), ctx.last_port);
+    try t.expectEqual(@as(u16, 54321), ctx.last_port);
     _ = app2.applyPort();
     app2.deinit();
     try t.expectEqual(@as(u32, 1), ctx.stops);
@@ -862,10 +862,10 @@ test "shell base url copy and alloc helpers agree" {
 
     const owned = try app.baseUrlAlloc("/models");
     defer t.allocator.free(owned);
-    try t.expectEqualStrings("http://127.0.0.1:8080/v1/models", owned);
+    try t.expectEqualStrings("http://127.0.0.1:54321/v1/models", owned);
 
     app.copyBaseUrl(nullUi());
-    try t.expectEqualStrings("Copied http://127.0.0.1:8080/v1", app.statusText());
+    try t.expectEqualStrings("Copied http://127.0.0.1:54321/v1", app.statusText());
 }
 
 test "shell tabs, layout breakpoints, and status badges" {
@@ -880,5 +880,5 @@ test "shell tabs, layout breakpoints, and status badges" {
     try t.expectEqualStrings("STOPPED", ServerStatus.stopped.badge());
     try t.expectEqualStrings("RUNNING", ServerStatus.running.badge());
     try t.expectEqualStrings("127.0.0.1", loopback);
-    try t.expectEqual(@as(u16, 8080), default_port);
+    try t.expectEqual(@as(u16, 54321), default_port);
 }

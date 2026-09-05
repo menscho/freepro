@@ -40,8 +40,9 @@
 // `?*rotator_mod.Rotator` (aka `proxy_mod.Rotator`).
 //   Proxy.init(alloc, cfg, .{ .rotator = ?*Rotator, .logger = ?*Logger,
 //                            .metrics = ?*Metrics }) Proxy
-//   proxy.start() !void  (binds 127.0.0.1:port, spawns its own accept
-//                         thread + worker pool, then returns)
+//   proxy.start() !void  (binds 127.0.0.1:port — or the next free port above
+//                         it when that one is already served — spawns its own
+//                         accept thread + worker pool, then returns)
 //   proxy.stop() void    (unblocks accept, joins workers, idempotent)
 //   proxy.deinit() void  (leaves borrowed config/log/metrics alone)
 // No main-side proxy thread is needed: Proxy.start() is non-blocking, so the
@@ -199,7 +200,22 @@ fn loadConfigOrDefaults(alloc: std.mem.Allocator, path: []const u8) !models.Prox
         return config_mod.defaultConfig(alloc);
     }
     g.log.info("loaded config from {s}", .{path});
+    if (config_mod.migrateLegacyDefaultPort(&cfg)) {
+        g.log.info("port migrated from the pre-0.1.4 default {d} to {d}", .{ config_mod.LEGACY_DEFAULT_PORT, cfg.port });
+    }
     return cfg;
+}
+
+/// Port to show the operator: the one the listener actually holds once the
+/// proxy is running — start() falls back to a free port above the configured
+/// one — otherwise the configured port.
+fn activePort() u16 {
+    if (comptime have_proxy) {
+        if (g.server) |*s| {
+            if (s.isRunning()) return s.boundPort();
+        }
+    }
+    return g.config.port;
 }
 
 /// Serialize the live config to disk (atomic tmp-file + rename inside
@@ -270,7 +286,7 @@ fn startProxy() bool {
             return false;
         };
         g.proxy_started.store(true, .release);
-        g.log.info("proxy listening on 127.0.0.1:{d}", .{g.config.port});
+        g.log.info("proxy listening on 127.0.0.1:{d}", .{activePort()});
         return true;
     } else {
         g.log.warn("proxy engine unavailable (proxy.zig does not compile yet); start ignored", .{});
@@ -302,7 +318,7 @@ fn hookStart(ctx: ?*anyopaque, port: u16) bool {
         return false;
     }
     self.app.status = .running;
-    self.app.setStatus("Proxy running on 127.0.0.1:{d}.", .{self.config.port});
+    self.app.setStatus("Proxy running on 127.0.0.1:{d}.", .{activePort()});
     return true;
 }
 
@@ -593,14 +609,14 @@ fn handleCommand(raw: []const u8) bool {
     } else if (std.mem.eql(u8, verb, "status")) {
         printStatus();
     } else if (std.mem.eql(u8, verb, "start")) {
-        if (hookStart(&g, g.config.port)) print("proxy started on {d}\n", .{g.config.port});
+        if (hookStart(&g, g.config.port)) print("proxy started on {d}\n", .{activePort()});
     } else if (std.mem.eql(u8, verb, "stop")) {
         hookStop(&g);
         g.app.status = .stopped;
         print("proxy stopped\n", .{});
     } else if (std.mem.eql(u8, verb, "restart")) {
         hookStop(&g);
-        if (hookStart(&g, g.config.port)) print("proxy restarted on {d}\n", .{g.config.port});
+        if (hookStart(&g, g.config.port)) print("proxy restarted on {d}\n", .{activePort()});
     } else if (std.mem.eql(u8, verb, "models")) {
         const rest = std.mem.trim(u8, words.rest(), " \t");
         if (rest.len > 0) g.models_view.setQuery(rest) catch {};
@@ -736,7 +752,7 @@ fn printStatus() void {
     const uptime_s = @divFloor(realtimeMillis() - g.start_ms, 1000);
     print("server: {s} on 127.0.0.1:{d} (uptime {d}s)\n", .{
         if (g.proxy_started.load(.acquire)) "RUNNING" else "STOPPED",
-        g.config.port,
+        activePort(),
         uptime_s,
     });
     print("providers: {d}  keys: {d} ({d} enabled)\n", .{ g.config.providers.len, keys, enabled });
@@ -844,7 +860,7 @@ pub fn main() !void {
     // Foreground GUI loop: refresh view state, render one frame, autosave.
     while (!g.shutdown.load(.acquire)) {
         g.state_mutex.lock();
-        g.dashboard_view.port = g.config.port;
+        g.dashboard_view.port = activePort();
         g.dashboard_view.server_running = g.proxy_started.load(.acquire);
         g.dashboard_view.refresh(g.config.providers, &g.metrics);
         g.models_view.refresh(g.config.providers) catch |err| {

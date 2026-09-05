@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """freepro dashboard surface verifier (stdlib only: urllib, json, sys, os, time).
 
-Usage:  python3 scripts/verify_dashboard.py [port]   (default port 8080)
+Usage:  python3 scripts/verify_dashboard.py [port]   (default port 54321)
 Base:   http://127.0.0.1:<port>
 
 Assumed dashboard contract (asserted below):
@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 54321
 BASE = "http://127.0.0.1:{0}".format(PORT)
 TIMEOUT = 10
 

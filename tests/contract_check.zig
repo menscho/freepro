@@ -406,7 +406,7 @@ test "models source: Key/Provider/ProxyConfig fields, defaults, presets" {
     try expectContains(text, "auto_start: bool = false,");
     try expectContains(text, "cooldown_secs: u64 = default_cooldown_secs,");
     try expectContains(text, "timeout_ms: u32 = default_timeout_ms,");
-    try expectContains(text, "pub const default_port: u16 = 8080;");
+    try expectContains(text, "pub const default_port: u16 = 54321;");
     try expectContains(text, "pub const default_cooldown_secs: u64 = 60;");
     try expectContains(text, "pub const default_timeout_ms: u32 = 30_000;");
     try expectContains(text, "pub const opencode_prefix: []const u8 = \"oc/\";");

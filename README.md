@@ -6,7 +6,7 @@
 
 A lightweight model proxy with an OpenAI-compatible API, automatic key rotation, and a compact dark dashboard.
 
-[Download v0.1.3](https://github.com/menscho/freepro/releases/tag/v0.1.3) · [Getting started](#getting-started) · [Build from source](#build-from-source)
+[Download v0.1.4](https://github.com/menscho/freepro/releases/tag/v0.1.4) · [Getting started](#getting-started) · [Build from source](#build-from-source)
 
 ![Version](https://img.shields.io/github/v/release/menscho/freepro?style=flat-square&color=879fff)
 ![License](https://img.shields.io/github/license/menscho/freepro?style=flat-square&color=879fff)
@@ -20,7 +20,7 @@ A lightweight model proxy with an OpenAI-compatible API, automatic key rotation,
 
 ## What it does
 
-- **One endpoint:** connect coding tools to `http://127.0.0.1:8080/v1`.
+- **One endpoint:** connect coding tools to `http://127.0.0.1:54321/v1`. If that port is already taken, freepro listens on the next free port instead and tells you which one.
 - **Provider management:** add keys, customize headers, test connectivity, and rotate across available keys.
 - **Model library:** choose which models clients can see, filter paid models, and configure reasoning levels.
 - **Usage you can inspect:** input, output, cached tokens, model breakdowns, daily history, and CSV export.
@@ -34,13 +34,13 @@ The GUI is served locally and opens in your browser. Its HTML, styles, scripts, 
 
 | Platform | Standalone download |
 | --- | --- |
-| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-windows-x86_64.exe) |
-| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-linux-x86_64) |
-| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-linux-arm64) |
-| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-macos-arm64) |
-| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-macos-x86_64) |
+| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.4/freepro-v0.1.4-windows-x86_64.exe) |
+| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.4/freepro-v0.1.4-linux-x86_64) |
+| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.4/freepro-v0.1.4-linux-arm64) |
+| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.4/freepro-v0.1.4-macos-arm64) |
+| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.4/freepro-v0.1.4-macos-x86_64) |
 
-Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.3/SHA256SUMS).
+Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.4/SHA256SUMS).
 
 ## Getting started
 
@@ -48,15 +48,15 @@ Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds
 2. On Windows, launch the `.exe`. On Linux or macOS, make the download executable and run it:
 
    ```sh
-   chmod +x ./freepro-v0.1.3-linux-x86_64
-   ./freepro-v0.1.3-linux-x86_64
+   chmod +x ./freepro-v0.1.4-linux-x86_64
+   ./freepro-v0.1.4-linux-x86_64
    ```
 
    Substitute your downloaded filename on macOS or ARM64.
 
-3. The dashboard opens at **http://127.0.0.1:8080**. In **Providers**, add the keys required by your providers.
+3. The dashboard opens at **http://127.0.0.1:54321** — or the next free port, if something already holds that one; the launch terminal and the dashboard header both show the port in use. In **Providers**, add the keys required by your providers.
 4. In **Model library**, enable the models you want to use.
-5. Set your coding tool's base URL to `http://127.0.0.1:8080/v1` and select a model ID from `/v1/models`.
+5. Set your coding tool's base URL to `http://127.0.0.1:54321/v1` and select a model ID from `/v1/models`.
 
 If your client requires an API key for the local endpoint, use a placeholder such as `freepro-local`. Upstream provider keys are configured in the dashboard. The local service binds to loopback and is intended for use on your own machine.
 

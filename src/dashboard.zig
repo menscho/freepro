@@ -507,7 +507,12 @@ fn handleKimiQuickAdd(c: *Controller, post: bool, body: []const u8, alloc: Alloc
     const parsed = std.json.parseFromSlice(struct { token: []const u8 }, alloc, body, .{}) catch return sendError(writer, 400, "Reload this page and try again.");
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.token, c.quickadd_token)) return sendError(writer, 400, "Reload this page and try again.");
-    const result = quickadd.apply(alloc, c.io, c.kimi_config_path, c.config.*) catch |err| {
+    // Kimi must be pointed at the port that is actually serving: start() falls
+    // back to a free port above the configured one, so the config port alone
+    // can name a port nothing listens on.
+    var snapshot = c.config.*;
+    if (c.isRunning()) snapshot.port = c.proxy.boundPort();
+    const result = quickadd.apply(alloc, c.io, c.kimi_config_path, snapshot) catch |err| {
         const msg = switch (err) {
             error.UnsafeToml => "This config uses an unsupported or ambiguous TOML layout. No changes were made.",
             error.NoEnabledModels => "Enable at least one model in the model library first.",

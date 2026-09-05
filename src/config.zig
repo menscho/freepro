@@ -61,6 +61,9 @@ pub const CONFIG_FILE_NAME = "freepro_config.json";
 
 /// Default proxy listen port (spec section 3).
 pub const DEFAULT_PORT: u16 = models.default_port;
+/// The port that was the default before v0.1.4. Configs still holding it were
+/// never pointed at it deliberately, so they migrate to `DEFAULT_PORT`.
+pub const LEGACY_DEFAULT_PORT: u16 = 8080;
 /// Default per-key cooldown after a 429/401/403 (seconds).
 pub const DEFAULT_COOLDOWN_SECS: u64 = models.default_cooldown_secs;
 /// Default upstream request timeout (milliseconds).
@@ -107,6 +110,16 @@ pub fn configFilePath(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8
     const dir = try configDirPath(gpa, env);
     defer gpa.free(dir);
     return fs_path.join(gpa, &.{ dir, CONFIG_FILE_NAME });
+}
+
+/// Moves a config off the pre-v0.1.4 default port so installs written by
+/// older builds pick up the new default — and with it the free-port fallback
+/// at launch — instead of staying pinned to the old number. Returns true when
+/// the port was changed, so the caller can log or force a save.
+pub fn migrateLegacyDefaultPort(cfg: *models.ProxyConfig) bool {
+    if (cfg.port != LEGACY_DEFAULT_PORT) return false;
+    cfg.port = DEFAULT_PORT;
+    return true;
 }
 
 /// Creates the parent directory of `file_path` and any missing ancestors
@@ -405,6 +418,21 @@ test "defaults ship the OpenCode and Kilo presets" {
     try std.testing.expectEqualStrings("High-throughput community gateway.", kilo.description);
     try std.testing.expectEqual(@as(usize, 0), kilo.keys.len);
     try std.testing.expectEqual(@as(usize, 0), kilo.headers.len);
+}
+
+test "configs left on the legacy default port migrate to the current one" {
+    const gpa = std.testing.allocator;
+    var cfg = try defaultConfig(gpa);
+    defer cfg.deinit(gpa);
+
+    cfg.port = LEGACY_DEFAULT_PORT;
+    try std.testing.expect(migrateLegacyDefaultPort(&cfg));
+    try std.testing.expectEqual(DEFAULT_PORT, cfg.port);
+
+    // A port chosen deliberately is left alone.
+    cfg.port = 9090;
+    try std.testing.expect(!migrateLegacyDefaultPort(&cfg));
+    try std.testing.expectEqual(@as(u16, 9090), cfg.port);
 }
 
 test "save/load round-trips edited settings and keys" {

@@ -383,7 +383,10 @@
 
   function statusPort() {
     var s = state.status || {};
-    return s.port || 8080;
+    // bound_port is the port the listener actually holds; the configured port
+    // is only a request, since a busy one falls back to the next free port.
+    if (s.running && s.bound_port) return s.bound_port;
+    return s.port || 54321;
   }
 
   function baseUrl() {
@@ -393,7 +396,7 @@
   function renderStatus(s) {
     state.status = s || {};
     var running = !!state.status.running;
-    var port = state.status.port || 8080;
+    var port = statusPort();
     var pill = byId("proxy-pill");
     if (pill) {
       pill.textContent = running ? "Listening on :" + port : "Proxy stopped";

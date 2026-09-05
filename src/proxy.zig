@@ -2,7 +2,8 @@
 //
 // freepro embedded proxy engine (Wave 2, Task 07: Zig 0.16 port).
 //
-// Multithreaded OpenAI-compatible HTTP listener on 127.0.0.1:<port>:
+// Multithreaded OpenAI-compatible HTTP listener on 127.0.0.1:<port>; when that
+// port is already served, the next free port above it is taken instead:
 //
 //   * GET  /v1/models             merged upstream catalog, provider prefixes
 //   * POST /v1/chat/completions   prefix routing + key failover + SSE/JSON relay
@@ -70,7 +71,7 @@
 //   Key{key, state, last_used, cooldown_until, consecutive_errors, enabled},
 //   Provider{display_name, base_url, prefix, description, keys, headers},
 //   CustomHeader{key, value},
-//   ProxyConfig{port=8080, providers, auto_start, cooldown_secs=60, timeout_ms}.
+//   ProxyConfig{port=54321, providers, auto_start, cooldown_secs=60, timeout_ms}.
 // Rotator API bridged (see "Rotator bridge" below):
 //   nextHealthyKey(provider_idx) ?usize / reportResult(p_idx, k_idx, ?u16).
 
@@ -397,9 +398,15 @@ pub const default_pool_threads: usize = 128;
 /// The proxy binds loopback only; it is never exposed on LAN interfaces.
 pub const loopback_ip: []const u8 = "127.0.0.1";
 
+/// How many loopback ports the listener will try: the configured one plus the
+/// `port_scan_span - 1` above it. A busy default therefore degrades to the
+/// next free port instead of failing the launch.
+pub const port_scan_span: u16 = 20;
+
 pub const ProxyError = error{
     FreeProxyUnavailable,
     AlreadyRunning,
+    PortUnavailable,
     BadRequest,
     HeadersTooLarge,
     BodyTooLarge,
@@ -524,7 +531,9 @@ pub const Proxy = struct {
         return self.running.load(.seq_cst);
     }
 
-    /// Port from the config the listener was bound with.
+    /// Port the listener actually holds: the configured one, or the free port
+    /// above it that start() fell back to. Equals the config port before the
+    /// first start.
     pub fn boundPort(self: *Proxy) u16 {
         return self.bound_port;
     }
@@ -543,16 +552,17 @@ pub const Proxy = struct {
         return self.total_served.load(.seq_cst);
     }
 
-    /// Bind 127.0.0.1:port and serve until stop(). Thread-safe; starting
-    /// twice returns error.AlreadyRunning.
+    /// Bind 127.0.0.1 and serve until stop(). Thread-safe; starting twice
+    /// returns error.AlreadyRunning. When the configured port is already
+    /// served by something else, the first free port above it within
+    /// `port_scan_span` is taken instead; `boundPort()` reports which one won.
     pub fn start(self: *Proxy) !void {
         self.mu.lock();
         defer self.mu.unlock();
 
         if (self.running.load(.seq_cst)) return ProxyError.AlreadyRunning;
 
-        const addr = try Net.IpAddress.parseIp4(loopback_ip, self.config.port);
-        var server = try addr.listen(self.io, .{ .reuse_address = true });
+        var server = try self.listenFirstFree();
         errdefer server.deinit(self.io);
 
         const cursors = try self.allocator.alloc(usize, self.config.providers.len);
@@ -561,7 +571,6 @@ pub const Proxy = struct {
 
         self.server = server;
         self.standalone_cursors = cursors;
-        self.bound_port = self.config.port;
         self.running.store(true, .seq_cst);
         errdefer self.running.store(false, .seq_cst);
 
@@ -573,7 +582,40 @@ pub const Proxy = struct {
             return err;
         };
 
-        self.logInfo("proxy listening on 127.0.0.1:{d}", .{self.config.port});
+        self.logInfo("proxy listening on 127.0.0.1:{d}", .{self.bound_port});
+    }
+
+    /// Probe-and-bind over `config.port` and the ports above it, returning the
+    /// first listener that comes up and recording its port on `bound_port`.
+    /// The probe matters on Windows, where SO_REUSEADDR lets bind() succeed
+    /// over a port another process is already serving: without it the fallback
+    /// would never trigger and clients would reach someone else's server.
+    fn listenFirstFree(self: *Proxy) !Net.Server {
+        var offset: u32 = 0;
+        while (offset < port_scan_span) : (offset += 1) {
+            const candidate: u32 = @as(u32, self.config.port) + offset;
+            if (candidate > std.math.maxInt(u16)) break;
+            const port: u16 = @intCast(candidate);
+            if (!self.portFree(port)) continue;
+            const addr = Net.IpAddress.parseIp4(loopback_ip, port) catch continue;
+            const server = addr.listen(self.io, .{ .reuse_address = true }) catch continue;
+            self.bound_port = port;
+            if (offset != 0) self.logWarn("port {d} is busy; using 127.0.0.1:{d} instead", .{ self.config.port, port });
+            return server;
+        }
+        return ProxyError.PortUnavailable;
+    }
+
+    /// True when nothing is serving 127.0.0.1:`port`. Asked as a client — a
+    /// connection that completes means a listener is behind it — rather than by
+    /// binding a throwaway socket: TIME_WAIT connections left over from served
+    /// requests make a non-reuse bind fail on a port the reuse bind would
+    /// happily take, which would walk the port upward on every stop/start.
+    fn portFree(self: *Proxy, port: u16) bool {
+        const addr = Net.IpAddress.parseIp4(loopback_ip, port) catch return false;
+        const probe = addr.connect(self.io, .{ .mode = .stream }) catch return true;
+        probe.close(self.io);
+        return false;
     }
 
     /// Pool entry point for the accept loop (Group task fns take args only).
@@ -2751,6 +2793,31 @@ test "loopback: health, empty models, unknown prefix" {
 
     try std.testing.expect(proxy.totalServedCount() >= 4);
     try std.testing.expectEqual(@as(usize, 0), proxy.inFlightCount());
+}
+
+test "loopback: a busy configured port falls back to the next free one" {
+    const alloc = std.testing.allocator;
+    const port = testPort(18088);
+
+    // Something else already serves the port the config asks for.
+    const blocker_addr = try Net.IpAddress.parseIp4(loopback_ip, port);
+    var blocker = try blocker_addr.listen(sharedIo(), .{ .reuse_address = true });
+    defer blocker.deinit(sharedIo());
+
+    var cfg = models.ProxyConfig{ .port = port };
+    var proxy = Proxy.init(alloc, &cfg, .{});
+    try proxy.start();
+    defer proxy.stop();
+
+    const bound = proxy.boundPort();
+    try std.testing.expect(bound > port);
+    try std.testing.expect(bound <= port + port_scan_span);
+
+    // The fallback port really serves, and the config keeps the port asked for.
+    const health = try testClientRequest(alloc, bound, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer alloc.free(health);
+    try std.testing.expectEqual(@as(u16, 200), try responseStatus(health));
+    try std.testing.expectEqual(port, cfg.port);
 }
 
 // Fake upstream: first POST -> 429, later POSTs -> 200 JSON echo of the model.
