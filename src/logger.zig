@@ -164,6 +164,11 @@ pub const Logger = struct {
         self.push(.request, "{s} {s} -> {d} ({d}ms)", .{ method, path, status, latency_ms });
     }
 
+    pub fn logRequestId(self: *Logger, request_id: u64, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void {
+        if (request_id == 0) return self.logRequest(method, path, status, latency_ms);
+        self.push(.request, "[r{d}] {s} {s} -> {d} ({d}ms)", .{ request_id, method, path, status, latency_ms });
+    }
+
     pub fn len(self: *Logger) usize {
         self.mu.lock();
         defer self.mu.unlock();

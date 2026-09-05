@@ -79,8 +79,12 @@ pub const Entry = struct {
     /// request transport failure attributable to the proxy; decrements on
     /// any success; drops the proxy at max_fails.
     fails: u32 = 0,
-    /// Total neutral-probe checks (proxy_pool "check_count").
+    /// Accepted neutral revalidation results; excludes discarded stale results.
     check_count: u32 = 0,
+    /// Consecutive failed neutral checks, independent of transport scores.
+    probe_failures: u32 = 0,
+    /// Changes whenever a lease or newer health result supersedes a probe.
+    health_revision: u64 = 0,
     /// Monotonic counter: higher = used more recently (skip for fairness).
     last_used: u64 = 0,
     /// Preferred after a successful real request; ties broken toward these.
@@ -173,6 +177,7 @@ pub const Pool = struct {
     candidates: CandidateList = .empty,
     candidate_cursor: usize = 0,
     clock: u64 = 0,
+    health_clock: u64 = 0,
     quarantine: [1024]struct { host: [15]u8 = @splat(0), len: usize = 0, port: u16 = 0, until: i64 = 0 } = @splat(.{}),
     quarantine_next: usize = 0,
     last_refresh_error: []const u8 = "",
@@ -284,7 +289,10 @@ pub const Pool = struct {
         const e = &self.entries.items[idx];
         const cool_ms: i64 = if (retry_after_ms != 0) @intCast(@min(retry_after_ms, std.math.maxInt(i64))) else 60_000;
         for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.host, e.host)) entry.blocked_until_ms = @max(entry.blocked_until_ms, self.now() +| cool_ms);
+            if (std.mem.eql(u8, entry.host, e.host)) {
+                self.touchHealth(entry);
+                entry.blocked_until_ms = @max(entry.blocked_until_ms, self.now() +| cool_ms);
+            }
         }
         return cool_ms;
     }
@@ -405,6 +413,7 @@ pub const Pool = struct {
         const e = &self.entries.items[idx];
         const host = arena.dupe(u8, e.host) catch return null;
         e.in_flight = true;
+        self.touchHealth(e);
         return .{ .host = host, .port = e.port, .index = idx, .leased = true };
     }
 
@@ -502,9 +511,11 @@ pub const Pool = struct {
         } else return;
         const e = &self.entries.items[index];
         if (!picked.leased and e.in_flight) return; // A background probe cannot evict a live lease.
+        self.touchHealth(e);
         if (picked.leased) e.in_flight = false;
         const healthy = ok orelse return; // A client disconnect says nothing about the route.
         if (healthy) {
+            e.probe_failures = 0;
             // proxy_pool score recovery: success improves the score. A real
             // 2xx through the route is as good as a neutral probe, so it also
             // refreshes validation freshness - a working route stays in
@@ -543,6 +554,7 @@ pub const Pool = struct {
             // Prefer the route that completed successfully, preserving cooldowns.
             for (self.entries.items) |*e2| {
                 if (e2.port == picked.port and std.mem.eql(u8, e2.host, picked.host)) {
+                    self.touchHealth(e2);
                     e2.preferred = true;
                     e2.validated_ms = at;
                     // A concurrent failure may have set a newer cooldown.
@@ -559,6 +571,7 @@ pub const Pool = struct {
             const base_ms: i64 = if (status == 429 or status == 403) 60_000 else 20_000;
             for (self.entries.items) |*e2| {
                 if (!std.mem.eql(u8, e2.host, picked.host)) continue;
+                self.touchHealth(e2);
                 e2.preferred = false;
                 e2.blocked_until_ms = @max(e2.blocked_until_ms, at + base_ms);
             }
@@ -566,10 +579,25 @@ pub const Pool = struct {
         }
     }
 
-    /// A neutral-probe failure (background check against the neutral target).
-    /// Unlike a real-request transport failure this is the strongest signal a
-    /// proxy is unusable, so it counts double toward the drop threshold.
-    fn reportProbeFailure(self: *Pool, host: []const u8, port: u16) void {
+    /// Called under the pool lock. Use a pool-wide revision to avoid accepting
+    /// results for an endpoint removed and subsequently inserted again.
+    fn touchHealth(self: *Pool, entry: *Entry) void {
+        self.health_clock +%= 1;
+        entry.health_revision = self.health_clock;
+    }
+
+    fn probeRevision(self: *Pool, host: []const u8, port: u16) ?u64 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.port != port or !std.mem.eql(u8, entry.host, host)) continue;
+            if (entry.in_flight or entry.blocked_until_ms > self.now()) return null;
+            return entry.health_revision;
+        }
+        return null;
+    }
+
+    fn finishProbe(self: *Pool, host: []const u8, port: u16, revision: ?u64, latency_ms: ?u32) void {
         self.mu.lock();
         defer self.mu.unlock();
         const index = for (self.entries.items, 0..) |item, i| {
@@ -577,19 +605,32 @@ pub const Pool = struct {
         } else return;
         const e = &self.entries.items[index];
         if (e.in_flight) return; // A live lease may be fine; probe again later.
-        // Soft strike: a single probe failure must NOT drop a route. Free
-        // proxies are flaky and the validation target/network can blip, which
-        // would otherwise mass-evict the whole pool (every idle route fails
-        // once -> dropped) and leave it empty for minutes. Drop only after
-        // probe_probe_fail_limit consecutive failures.
+        if (revision) |expected| if (e.health_revision != expected) return;
+        self.touchHealth(e);
+        e.check_count +|= 1;
+        if (latency_ms) |latency| {
+            e.probe_failures = 0;
+            e.validated_ms = self.now();
+            e.latency_ms = latency;
+            if (e.fails > 0) e.fails -= 1;
+            e.last_ok_ms = self.now();
+            return;
+        }
+        // Transport failures affect the score, but must not masquerade as
+        // additional consecutive neutral checks in the retirement decision.
+        e.probe_failures = @min(e.probe_failures + 1, probe_drop_fail_limit);
         e.fails = @min(e.fails + 1, probe_drop_fail_limit);
-        if (e.fails >= probe_drop_fail_limit) {
+        if (e.probe_failures >= probe_drop_fail_limit) {
             const h = self.entries.items[index].host;
             self.quarantineRoute(h, e.port, 5 * 60 * 1000);
             self.logInfo("proxy pool: dropping {s} (failed {d} consecutive probes)", .{ h, probe_drop_fail_limit });
             _ = self.entries.orderedRemove(index);
             self.alloc.free(h);
         }
+    }
+
+    fn reportProbeFailure(self: *Pool, host: []const u8, port: u16) void {
+        self.finishProbe(host, port, null, null);
     }
 
     /// Called when a request got a 429/403 AND the same proxy failed a neutral
@@ -718,28 +759,19 @@ pub const Pool = struct {
             fn run(job: @This()) void {
                 if (job.is_existing) {
                     // Re-probe an idle route. Success recovers its score.
+                    const revision = job.pool.probeRevision(job.candidate.host, job.candidate.port) orelse return;
                     const t0 = nowMs();
                     timed(void, job.pool.io, max_latency_ms, probeThrough, .{
                         job.pool, job.candidate.host, job.candidate.port,
                     }) catch {
                         // Only count the failure when the checker itself is up;
                         // otherwise skip (retry next cycle) rather than evict.
-                        if (job.target_up) job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
+                        if (job.target_up) job.pool.finishProbe(job.candidate.host, job.candidate.port, revision, null);
                         return;
                     };
                     // Neutral revalidation must not generate extra model traffic or
                     // turn an origin throttle into a transport-health penalty.
-                    job.pool.mu.lock();
-                    for (job.pool.entries.items) |*e| {
-                        if (e.port == job.candidate.port and std.mem.eql(u8, e.host, job.candidate.host)) {
-                            e.validated_ms = nowMs();
-                            e.latency_ms = @intCast(@max(0, nowMs() - t0));
-                            if (e.fails > 0) e.fails -= 1;
-                            e.last_ok_ms = nowMs();
-                            break;
-                        }
-                    }
-                    job.pool.mu.unlock();
+                    job.pool.finishProbe(job.candidate.host, job.candidate.port, revision, @intCast(@max(0, nowMs() - t0)));
                     return;
                 }
                 job.pool.mu.lock();
@@ -773,10 +805,7 @@ pub const Pool = struct {
                 if (p.quarantined(job.candidate.host, job.candidate.port)) return;
                 for (p.entries.items) |*e| {
                     if (e.port == job.candidate.port and std.mem.eql(u8, e.host, job.candidate.host)) {
-                        e.latency_ms = @intCast(@max(0, nowMs() - t0));
-                        e.validated_ms = nowMs();
-                        e.last_ok_ms = nowMs();
-                        if (e.fails > 0) e.fails -= 1;
+                        // Another insertion supersedes this candidate's check.
                         return;
                     }
                 }
@@ -799,6 +828,7 @@ pub const Pool = struct {
                     p.alloc.free(host);
                     return;
                 };
+                p.touchHealth(&p.entries.items[p.entries.items.len - 1]);
             }
         };
         const Work = struct {
@@ -1389,11 +1419,13 @@ test "neutral probe failure drops only after repeated strikes; recovery helps" {
     const route = pool.pick(a).?;
     defer a.free(route.host);
     // A few neutral failures must NOT drop the route (soft strikes).
+    pool.report(route, 0, null);
     for (0..3) |_| pool.reportProbeFailure("127.0.0.1", 4001);
     try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 3), pool.entries.items[0].probe_failures);
     // A subsequent success recovers the score.
-    pool.report(route, 5, true);
-    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].fails);
+    pool.finishProbe("127.0.0.1", 4001, pool.probeRevision("127.0.0.1", 4001), 5);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].probe_failures);
     // Enough consecutive neutral failures finally drop it.
     for (0..probe_drop_fail_limit) |_| pool.reportProbeFailure("127.0.0.1", 4001);
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
@@ -1679,4 +1711,64 @@ test "large queues grow cold-route trials within a fixed cap" {
         a.free(r.host);
     }
     pool.waiting = 0;
+}
+
+test "stale neutral results cannot overwrite a newer request outcome" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8000 });
+    const old_probe = pool.probeRevision("127.0.0.1", 8000).?;
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.finishProbe(route.host, route.port, old_probe, null);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].fails);
+    pool.report(route, 5, true);
+    pool.finishProbe(route.host, route.port, old_probe, null);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].fails);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].check_count);
+
+    const another_probe = pool.probeRevision(route.host, route.port).?;
+    const next = pool.pick(a).?;
+    defer a.free(next.host);
+    pool.report(next, 0, false);
+    const cooldown = pool.entries.items[0].blocked_until_ms;
+    pool.finishProbe(next.host, next.port, another_probe, 1);
+    try std.testing.expectEqual(@as(u32, 1), pool.entries.items[0].fails);
+    try std.testing.expectEqual(cooldown, pool.entries.items[0].blocked_until_ms);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].check_count);
+}
+
+test "retirement counts consecutive neutral failures independently" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8000, .fails = 1 });
+    for (0..3) |_| pool.reportProbeFailure("127.0.0.1", 8000);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 3), pool.entries.items[0].probe_failures);
+    pool.finishProbe("127.0.0.1", 8000, pool.probeRevision("127.0.0.1", 8000), 5);
+    for (0..3) |_| pool.reportProbeFailure("127.0.0.1", 8000);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 7), pool.entries.items[0].check_count);
+    pool.reportProbeFailure("127.0.0.1", 8000);
+    try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
+}
+
+test "replacement endpoint does not accept an earlier incarnation probe" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8000 });
+    pool.touchHealth(&pool.entries.items[0]);
+    const revision = pool.probeRevision("127.0.0.1", 8000).?;
+    const old = pool.entries.orderedRemove(0);
+    a.free(old.host);
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8000 });
+    pool.touchHealth(&pool.entries.items[0]);
+    pool.finishProbe("127.0.0.1", 8000, revision, null);
+    try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].fails);
 }

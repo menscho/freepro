@@ -1,5 +1,5 @@
 """Deterministic transport faults through CONNECT; no real keys or public proxies."""
-import json,os,socket,subprocess,threading,time,sys,struct
+import json,os,socket,subprocess,threading,time,sys,struct,re
 from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
@@ -126,6 +126,10 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False,pretrip=Fal
   output,err=proc.communicate(b'quit\n',timeout=10)
   assert proc.returncode==0,err.decode(errors='replace')[-2000:]
   state=json.loads(output);assert state['cooldown']==0,state
+  final_ids=[m.group(1) for line in state['logs'] if (m:=re.match(r'\[r(\d+)\] POST /v1/chat/completions ->',line))]
+  assert len(final_ids)==1,state
+  attempt_lines=[line for line in state['logs'] if 'public proxy' in line]
+  assert all(re.match(r'\[r'+final_ids[0]+r' a\d+\] ',line) for line in attempt_lines),state
   assert raw.count(b'HTTP/1.1')==1,(raw[:500],state,err.decode(errors='replace')[-2000:])
   return raw,elapsed,[h.seen for h in hops],state
  finally:

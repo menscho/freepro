@@ -6,7 +6,7 @@
 
 A lightweight model proxy with an OpenAI-compatible API, automatic key rotation, and a compact dark dashboard.
 
-[Download v0.1.18](https://github.com/menscho/freepro/releases/tag/v0.1.18) · [Getting started](#getting-started) · [Build from source](#build-from-source)
+[Download v0.1.19](https://github.com/menscho/freepro/releases/tag/v0.1.19) · [Getting started](#getting-started) · [Build from source](#build-from-source)
 
 ![Version](https://img.shields.io/github/v/release/menscho/freepro?style=flat-square&color=879fff)
 ![License](https://img.shields.io/github/license/menscho/freepro?style=flat-square&color=879fff)
@@ -34,13 +34,13 @@ The GUI is served locally and opens in your browser. Its HTML, styles, scripts, 
 
 | Platform | Standalone download |
 | --- | --- |
-| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.18/freepro-v0.1.18-windows-x86_64.exe) |
-| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.18/freepro-v0.1.18-linux-x86_64) |
-| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.18/freepro-v0.1.18-linux-arm64) |
-| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.18/freepro-v0.1.18-macos-arm64) |
-| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.18/freepro-v0.1.18-macos-x86_64) |
+| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.19/freepro-v0.1.19-windows-x86_64.exe) |
+| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.19/freepro-v0.1.19-linux-x86_64) |
+| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.19/freepro-v0.1.19-linux-arm64) |
+| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.19/freepro-v0.1.19-macos-arm64) |
+| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.19/freepro-v0.1.19-macos-x86_64) |
 
-Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.18/SHA256SUMS).
+Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.19/SHA256SUMS).
 
 ## Getting started
 
@@ -48,8 +48,8 @@ Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds
 2. On Windows, launch the `.exe`. On Linux or macOS, make the download executable and run it:
 
    ```sh
-   chmod +x ./freepro-v0.1.18-linux-x86_64
-   ./freepro-v0.1.18-linux-x86_64
+   chmod +x ./freepro-v0.1.19-linux-x86_64
+   ./freepro-v0.1.19-linux-x86_64
    ```
 
    Substitute your downloaded filename on macOS or ARM64.
@@ -104,7 +104,7 @@ The config contains provider credentials. Keep it private. Usage is saved period
 
 The pool already reuses successful routes and checks idle routes in the background with up to 40 validation workers. Neutral checks must receive the expected empty HTTP 204; an HTML page, redirect, or inconsistent body framing does not qualify. The direct checker-health request has a four-second deadline, so a silent endpoint cannot hold up validation indefinitely. If the checker is unreachable, failed probes do not penalize existing routes.
 
-These checks establish transport reachability, not model availability or quota. A successful probe cannot guarantee a later completion or eliminate upstream 429 responses. Version 0.1.18 fixes checker stalls and false positives; it does not establish a new live-model latency benchmark.
+These checks establish transport reachability, not model availability or quota. A successful probe cannot guarantee a later completion or eliminate upstream 429 responses. Version 0.1.18 fixed checker stalls and false positives. Version 0.1.19 prevents stale probes from overwriting newer request outcomes, counts consecutive probe failures independently, and correlates retries with request IDs and phase timings. Neither release establishes a new live-model latency benchmark. See the [transport reliability review](docs/transport-reliability.md) for findings, source comparisons, and how to interpret a stalled request.
 
 ## Build from source
 

@@ -221,13 +221,15 @@ fn sharedIo() std.Io {
 pub const Logger = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
+    request_id: u64 = 0,
+    attempt: usize = 0,
 
     pub const VTable = struct {
         info: *const fn (ctx: *anyopaque, msg: []const u8) void,
         warn: *const fn (ctx: *anyopaque, msg: []const u8) void,
         err: *const fn (ctx: *anyopaque, msg: []const u8) void,
         failover: *const fn (ctx: *anyopaque, from_1based: usize, status: u16, to_1based: usize) void,
-        log_request: *const fn (ctx: *anyopaque, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void,
+        log_request: *const fn (ctx: *anyopaque, request_id: u64, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void,
     };
 
     /// Adapt a concrete logger pointer (e.g. *logger_mod.Logger). The pointer
@@ -251,9 +253,11 @@ pub const Logger = struct {
                 const self: P = @ptrCast(@alignCast(ctx));
                 self.failover(from_1based, status, to_1based);
             }
-            fn logRequest(ctx: *anyopaque, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void {
+            fn logRequest(ctx: *anyopaque, request_id: u64, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void {
                 const self: P = @ptrCast(@alignCast(ctx));
-                self.logRequest(method, path, status, latency_ms);
+                if (@hasDecl(@typeInfo(P).pointer.child, "logRequestId")) {
+                    self.logRequestId(request_id, method, path, status, latency_ms);
+                } else self.logRequest(method, path, status, latency_ms);
             }
         };
         const vt: VTable = .{
@@ -268,19 +272,28 @@ pub const Logger = struct {
 
     pub fn info(self: Logger, comptime fmt: []const u8, args: anytype) void {
         var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch "(log message too long)";
+        const msg = (if (self.request_id != 0)
+            std.fmt.bufPrint(&buf, "[r{d} a{d}] " ++ fmt, .{ self.request_id, self.attempt } ++ args)
+        else
+            std.fmt.bufPrint(&buf, fmt, args)) catch "(log message too long)";
         self.vtable.info(self.ctx, msg);
     }
 
     pub fn warn(self: Logger, comptime fmt: []const u8, args: anytype) void {
         var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch "(log message too long)";
+        const msg = (if (self.request_id != 0)
+            std.fmt.bufPrint(&buf, "[r{d} a{d}] " ++ fmt, .{ self.request_id, self.attempt } ++ args)
+        else
+            std.fmt.bufPrint(&buf, fmt, args)) catch "(log message too long)";
         self.vtable.warn(self.ctx, msg);
     }
 
     pub fn err(self: Logger, comptime fmt: []const u8, args: anytype) void {
         var buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch "(log message too long)";
+        const msg = (if (self.request_id != 0)
+            std.fmt.bufPrint(&buf, "[r{d} a{d}] " ++ fmt, .{ self.request_id, self.attempt } ++ args)
+        else
+            std.fmt.bufPrint(&buf, fmt, args)) catch "(log message too long)";
         self.vtable.err(self.ctx, msg);
     }
 
@@ -293,7 +306,7 @@ pub const Logger = struct {
     /// One line per proxied client call, e.g.
     /// `POST /v1/chat/completions -> 200 (42ms)`.
     pub fn logRequest(self: Logger, method: []const u8, path: []const u8, status: u16, latency_ms: u64) void {
-        self.vtable.log_request(self.ctx, method, path, status, latency_ms);
+        self.vtable.log_request(self.ctx, self.request_id, method, path, status, latency_ms);
     }
 };
 
@@ -833,7 +846,10 @@ fn handleConn(ctx: *ConnContext) void {
 // Inbound HTTP framing
 // ---------------------------------------------------------------------------
 
+var next_request_id: std.atomic.Value(u64) = .init(0);
+
 const InboundRequest = struct {
+    request_id: u64 = 0,
     method: []const u8,
     path: []const u8,
     body: []const u8,
@@ -1092,6 +1108,9 @@ const ClientWriter = struct {
 fn handleConnection(self: *Proxy, stream: Net.Stream) !void {
     if (builtin.os.tag == .windows) try stream.setTimeouts(self.config.timeout_ms, @min(self.config.timeout_ms, 10_000));
     const t0 = nowMs();
+    const request_id = next_request_id.fetchAdd(1, .monotonic) +% 1;
+    var request_log = self.logger;
+    if (request_log) |*l| l.request_id = request_id;
     _ = self.in_flight.fetchAdd(1, .seq_cst);
     var metrics_started = false;
 
@@ -1118,11 +1137,11 @@ fn handleConnection(self: *Proxy, stream: Net.Stream) !void {
         if (dashboard_req) {
             // Dashboard/API traffic: no served-count, log only failures.
             if (status >= 400) {
-                if (self.logger) |l| l.warn("dashboard {s} {s} -> {d}", .{ method, path, status });
+                if (request_log) |l| l.warn("dashboard {s} {s} -> {d}", .{ method, path, status });
             }
         } else {
             _ = self.total_served.fetchAdd(1, .seq_cst);
-            if (self.logger) |l| l.logRequest(method, path, status, latency);
+            if (request_log) |l| l.logRequest(method, path, status, latency);
         }
     }
 
@@ -1141,21 +1160,24 @@ fn handleConnection(self: *Proxy, stream: Net.Stream) !void {
     const writer = &client_writer.interface;
     defer writer.flush() catch {};
 
-    const raw = socketTimed([]u8, stream, self.io, self.config.timeout_ms, readFramedMessage, .{ reader, alloc }) catch {
+    const raw = socketTimed([]u8, stream, self.io, self.config.timeout_ms, readFramedMessage, .{ reader, alloc }) catch |err| {
+        if (request_log) |l| l.warn("inbound HTTP read failed: {s}; no upstream request sent", .{@errorName(err)});
         sendStatus(writer, 400, "malformed http request") catch {};
         status = 400;
         return;
     };
-    const req = parseRequest(raw) catch {
+    var req = parseRequest(raw) catch |err| {
+        if (request_log) |l| l.warn("inbound HTTP parse failed: {s}; no upstream request sent", .{@errorName(err)});
         sendStatus(writer, 400, "malformed http request") catch {};
         status = 400;
         return;
     };
+    req.request_id = request_id;
     method = req.method;
     path = req.path;
 
     status = routeRequest(self, writer, alloc, req, &provider_idx, &dashboard_req, &metrics_started) catch |err| {
-        if (self.logger) |l| l.err("route {s} {s}: {s}", .{ req.method, req.path, @errorName(err) });
+        if (request_log) |l| l.err("route {s} {s}: {s}", .{ req.method, req.path, @errorName(err) });
         sendStatus(writer, 500, "internal proxy error") catch {};
         status = 500;
         return;
@@ -1658,7 +1680,16 @@ const AttemptContext = struct {
     deadline_ms: i64,
     committed: bool = false,
     phase: []const u8 = "connect",
+    phase_started_ms: i64 = 0,
+    logger: ?Logger = null,
     routes: std.ArrayList(freeproxy.Picked) = .empty,
+    fn beginPhase(self: *AttemptContext, io: std.Io, phase: []const u8) void {
+        self.phase = phase;
+        self.phase_started_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    }
+    fn phaseElapsed(self: *const AttemptContext, io: std.Io) i64 {
+        return @max(0, std.Io.Clock.awake.now(io).toMilliseconds() - self.phase_started_ms);
+    }
     fn remaining(self: *AttemptContext, io: std.Io, cap_ms: u64) !u64 {
         const left = self.deadline_ms - std.Io.Clock.awake.now(io).toMilliseconds();
         if (left <= 0) return error.Timeout;
@@ -1722,7 +1753,7 @@ fn forwardAttempt(
             // Only stop when the breaker is open AND no eligible route remains.
             if (pool.originThrottleBlocks(prov.prefix)) return error.OriginThrottled;
             pool.noteDemand();
-            ctx.phase = "waiting for public proxy";
+            ctx.beginPhase(self.io, "waiting for public proxy");
             // Wait for busy healthy routes within bounded admission and the
             // request deadline; a short fixed cap fails ordinary agent bursts.
             const wait_budget = try ctx.remaining(self.io, @min(30_000, self.config.timeout_ms));
@@ -1777,7 +1808,7 @@ fn forwardAttempt(
         },
         .extra_headers = priv.extras,
     };
-    ctx.phase = "connect/TLS";
+    ctx.beginPhase(self.io, "connect/TLS");
     var req = if (picked_proxy != null)
         try freeproxy.timed(HttpClient.Request, self.io, try ctx.remaining(self.io, 8000), HttpClient.request, .{ &client, .POST, uri, request_options })
     else
@@ -1788,12 +1819,12 @@ fn forwardAttempt(
     // Responses-wire providers send the translated body, not the original.
     const outbound = wire_body;
     const owned_body = try alloc.dupe(u8, outbound);
-    ctx.phase = "upload";
+    ctx.beginPhase(self.io, "upload");
     if (picked_proxy != null) {
         try socketTimed(void, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, 8000), HttpClient.Request.sendBodyComplete, .{ &req, owned_body });
     } else try req.sendBodyComplete(owned_body);
 
-    ctx.phase = "response headers";
+    ctx.beginPhase(self.io, "response headers");
     var redirect_buf: [512]u8 = undefined;
     var response = if (picked_proxy != null)
         try socketTimed(HttpClient.Response, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), HttpClient.Request.receiveHead, .{ &req, &redirect_buf })
@@ -1806,7 +1837,7 @@ fn forwardAttempt(
     const retry_after_ms = parseRetryAfter(response.head);
     if (picked_proxy) |picked| {
         if (!models.isHealthyStatus(status)) self.free_proxies.?.routeStatus(picked, status);
-        if (self.logger) |l| l.info("public proxy {s}:{d}: response headers {d} (body pending)", .{ picked.host, picked.port, status });
+        if (ctx.logger) |l| l.info("public proxy {s}:{d}: response headers {d} after {d}ms (body pending)", .{ picked.host, picked.port, status, ctx.phaseElapsed(self.io) });
     }
     const ctype = response.head.content_type orelse "";
     const upstream_sse = headerValueHas(ctype, "text/event-stream");
@@ -1814,7 +1845,7 @@ fn forwardAttempt(
     var transfer: [4096]u8 = undefined;
     const reader = response.reader(&transfer);
 
-    ctx.phase = "response body";
+    ctx.beginPhase(self.io, "response body");
     if (models.isHealthyStatus(status)) {
         if (upstream_sse and !responses_mode) {
             // The upstream has confirmed 200 + text/event-stream. Send the
@@ -1896,7 +1927,7 @@ fn forwardAttempt(
                 sendSyntheticChat(writer, alloc, resp_body) catch return error.ClientDisconnected;
             } else sendJson(writer, status, resp_body) catch return error.ClientDisconnected;
         }
-        if (picked_proxy) |picked| if (self.logger) |l| l.info("public proxy {s}:{d}: completed HTTP {d}", .{ picked.host, picked.port, status });
+        if (picked_proxy) |picked| if (ctx.logger) |l| l.info("public proxy {s}:{d}: completed HTTP {d}", .{ picked.host, picked.port, status });
         return .{ .status = status, .body = &.{}, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0, .retry_after_ms = retry_after_ms };
     }
 
@@ -1958,9 +1989,14 @@ fn handleCompletions(
     var last_status: u16 = 503;
     var last_body: []const u8 = &.{};
     var tried_any = false;
-    var ctx: AttemptContext = .{ .deadline_ms = std.Io.Clock.awake.now(self.io).toMilliseconds() + self.config.timeout_ms };
+    var ctx: AttemptContext = .{ .deadline_ms = std.Io.Clock.awake.now(self.io).toMilliseconds() + self.config.timeout_ms, .logger = self.logger };
+
+    if (ctx.logger) |*l| l.request_id = req.request_id;
+    if (ctx.logger) |l| l.info("request accepted; upstream budget {d}ms", .{self.config.timeout_ms});
 
     while (attempts < max_attempts) : (attempts += 1) {
+        if (ctx.logger) |*l| l.attempt = attempts + 1;
+        ctx.beginPhase(self.io, "request preparation");
         if (ms_free_proxy and std.Io.Clock.awake.now(self.io).toMilliseconds() >= ctx.deadline_ms) {
             last_status = 504;
             last_body = &.{};
@@ -1972,7 +2008,7 @@ fn handleCompletions(
         tried_any = true;
 
         if (pending_failover) |pf| {
-            if (self.logger) |l| {
+            if (ctx.logger) |l| {
                 if (ms_free_proxy) l.info("public proxy route failed ({d}); trying another egress", .{pf.status}) else l.failover(pf.from + 1, pf.status, key_idx + 1);
             }
             pending_failover = null;
@@ -1980,16 +2016,16 @@ fn handleCompletions(
 
         var outcome = forwardAttempt(self, p_idx, key_idx, endpoint, upstream_body, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
             if (err == error.ClientDisconnected) {
-                if (self.logger) |l| l.info("client disconnected; upstream request will not be replayed", .{});
+                if (ctx.logger) |l| l.info("client disconnected; upstream request will not be replayed", .{});
                 return 499;
             }
             if (ctx.committed) {
-                if (self.logger) |l| l.warn("upstream stream interrupted during {s}: {s}; not replaying a partial response", .{ ctx.phase, @errorName(err) });
+                if (ctx.logger) |l| l.warn("upstream stream interrupted during {s}: {s}; not replaying a partial response", .{ ctx.phase, @errorName(err) });
                 return 502; // Close the stream, never append another HTTP response.
             }
             if (err == ProxyError.OriginThrottled) {
                 // The breaker was already open when this attempt started.
-                if (self.logger) |l| l.warn("public proxy attempt skipped: all eligible routes cooling after upstream 429/403 responses", .{});
+                if (ctx.logger) |l| l.warn("public proxy attempt skipped: all eligible routes cooling after upstream 429/403 responses", .{});
                 try sendStatus(writer, 429, "available public proxy routes are cooling after upstream rate limits; try again shortly");
                 return 429;
             }
@@ -1998,7 +2034,7 @@ fn handleCompletions(
                 // Preserve key health and expose why no route was available.
                 if (self.free_proxies) |pool| {
                     const capacity = pool.diag();
-                    if (self.logger) |l| l.warn("public proxy capacity unavailable: {d} ready, {d} busy, {d} blocked, {d} waiting (API keys unchanged)", .{ capacity.ready, capacity.busy, capacity.blocked, capacity.waiting });
+                    if (ctx.logger) |l| l.warn("public proxy capacity unavailable: {d} ready, {d} busy, {d} blocked, {d} waiting (API keys unchanged)", .{ capacity.ready, capacity.busy, capacity.blocked, capacity.waiting });
                 }
                 if (last_body.len != 0) {
                     try sendJson(writer, last_status, last_body);
@@ -2009,8 +2045,8 @@ fn handleCompletions(
             }
             if (!ms_free_proxy and !anon_key) self.reportKey(p_idx, key_idx, null);
             if (self.metrics) |m| m.noteFailover();
-            if (self.logger) |l| {
-                if (ms_free_proxy) l.warn("public proxy failed during {s}: {s} (API key unchanged)", .{ ctx.phase, @errorName(err) }) else if (anon_key) l.warn("anonymous upstream failed during {s}: {s}", .{ ctx.phase, @errorName(err) }) else l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
+            if (ctx.logger) |l| {
+                if (ms_free_proxy) l.warn("public proxy failed during {s}: {s} ({d}ms in phase; API key unchanged)", .{ ctx.phase, @errorName(err), ctx.phaseElapsed(self.io) }) else if (anon_key) l.warn("anonymous upstream failed during {s}: {s}", .{ ctx.phase, @errorName(err) }) else l.warn("key #{d} transport error: {s}", .{ key_idx + 1, @errorName(err) });
             }
             pending_failover = .{ .from = key_idx, .status = 502 };
             last_status = if (err == error.Timeout) 504 else 502;
@@ -2023,7 +2059,7 @@ fn handleCompletions(
         };
         if (needsThinkingRepair(outcome.status, outcome.body)) {
             const repaired = try thinkingBody(alloc, upstream_body);
-            if (self.logger) |l| l.info("model requires thinking; retrying once with low effort", .{});
+            if (ctx.logger) |l| l.info("model requires thinking; retrying once with low effort", .{});
             outcome = forwardAttempt(self, p_idx, key_idx, endpoint, repaired, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
                 if (err == error.ClientDisconnected) return 499;
                 if (ctx.committed) return 502;
@@ -2099,7 +2135,7 @@ fn handleCompletions(
     }
 
     if (!tried_any) {
-        if (self.logger) |l| l.warn("no eligible API key for provider {s}, model {s}; request did not reach public proxy selection", .{ prov.prefix, ms.model });
+        if (ctx.logger) |l| l.warn("no eligible API key for provider {s}, model {s}; request did not reach public proxy selection", .{ prov.prefix, ms.model });
         try sendStatus(writer, 503, "all API keys for this provider are exhausted or cooling down");
         return 503;
     }
