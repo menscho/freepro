@@ -43,6 +43,11 @@ pub const max_latency_ms: u64 = 4000;
 /// proxy itself caused); a proxy that had a bad stretch recovers because
 /// success decrements `fails`. Origin 429/403 never count here.
 pub const max_fails: u32 = 2;
+/// A route is dropped only after this many CONSECUTIVE neutral-probe failures.
+/// One blip (or a probe-target/network outage) must not evict a working route:
+/// that used to mass-drop the whole pool in seconds when the checker was
+/// briefly unreachable, leaving it empty for minutes.
+pub const probe_drop_fail_limit: u32 = 4;
 /// Cadence of the proxy_pool-style "getter": re-pull the source lists.
 pub const list_refresh_ms: i64 = 5 * 60 * 1000;
 /// Cadence of the "tester (use)": re-validate idle routes against the neutral
@@ -552,11 +557,16 @@ pub const Pool = struct {
         } else return;
         const e = &self.entries.items[index];
         if (e.in_flight) return; // A live lease may be fine; probe again later.
-        e.fails = @min(e.fails + 2, max_fails);
-        if (e.fails >= max_fails) {
+        // Soft strike: a single probe failure must NOT drop a route. Free
+        // proxies are flaky and the validation target/network can blip, which
+        // would otherwise mass-evict the whole pool (every idle route fails
+        // once -> dropped) and leave it empty for minutes. Drop only after
+        // probe_probe_fail_limit consecutive failures.
+        e.fails = @min(e.fails + 1, probe_drop_fail_limit);
+        if (e.fails >= probe_drop_fail_limit) {
             const h = self.entries.items[index].host;
             self.quarantineRoute(h, e.port, 5 * 60 * 1000);
-            self.logInfo("proxy pool: dropping {s} (failed the neutral probe)", .{h});
+            self.logInfo("proxy pool: dropping {s} (failed {d} consecutive probes)", .{ h, probe_drop_fail_limit });
             _ = self.entries.orderedRemove(index);
             self.alloc.free(h);
         }
@@ -669,6 +679,9 @@ pub const Pool = struct {
             pool: *Pool,
             candidate: Candidate,
             is_existing: bool,
+            /// False when the neutral target/network is down this cycle: probe
+            /// failures then must NOT drop routes (they are not proxy deaths).
+            target_up: bool,
             fn run(job: @This()) void {
                 if (job.is_existing) {
                     // Re-probe an idle route. Success recovers its score.
@@ -676,7 +689,9 @@ pub const Pool = struct {
                     timed(void, job.pool.io, max_latency_ms, probeThrough, .{
                         job.pool, job.candidate.host, job.candidate.port,
                     }) catch {
-                        job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
+                        // Only count the failure when the checker itself is up;
+                        // otherwise skip (retry next cycle) rather than evict.
+                        if (job.target_up) job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
                         return;
                     };
                     // Origin-aware re-check for idle routes too: a route the
@@ -685,7 +700,7 @@ pub const Pool = struct {
                         const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
                             job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
                         }) catch false;
-                        if (!origin_ok) {
+                        if (!origin_ok and job.target_up) {
                             job.pool.quarantineRoute(job.candidate.host, job.candidate.port, 10 * 60 * 1000);
                             job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
                             return;
@@ -767,6 +782,7 @@ pub const Pool = struct {
             pool: *Pool,
             candidates: []const Candidate,
             cursor: std.atomic.Value(usize) = .init(0),
+            target_up: bool,
             fn run(work: *@This()) std.Io.Cancelable!void {
                 while (true) {
                     try std.Io.checkCancel(work.pool.io);
@@ -776,11 +792,15 @@ pub const Pool = struct {
                     const enough = work.pool.readyCount() >= target_ready;
                     work.pool.mu.unlock();
                     if (enough and i >= max_pool) return;
-                    Job.run(.{ .pool = work.pool, .candidate = work.candidates[i], .is_existing = work.candidates[i].existing });
+                    Job.run(.{ .pool = work.pool, .candidate = work.candidates[i], .is_existing = work.candidates[i].existing, .target_up = work.target_up });
                 }
             }
         };
-        var work: Work = .{ .pool = pool, .candidates = fresh.items };
+        // Capture checker health once this cycle: if the neutral target is
+        // unreachable directly, the network is down and probe failures must
+        // not evict routes (that used to mass-drop the pool).
+        const target_up = neutralTargetUp(pool.io);
+        var work: Work = .{ .pool = pool, .candidates = fresh.items, .target_up = target_up };
         var validators: std.Io.Group = .init;
         defer validators.cancel(pool.io);
         for (0..@min(validation_workers, fresh.items.len)) |_| {
@@ -1006,6 +1026,27 @@ pub fn probeNeutralOk(io: std.Io, host: []const u8, port: u16) bool {
     defer client.deinit();
     client.http_proxy = proxy;
     client.https_proxy = proxy;
+    var req = client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+    }) catch return false;
+    defer req.deinit();
+    req.sendBodiless() catch return false;
+    var redirect_buf: [512]u8 = undefined;
+    const response = req.receiveHead(&redirect_buf) catch return false;
+    return @intFromEnum(response.head.status) / 100 == 2;
+}
+
+/// Direct (no-proxy) check that the neutral validation target is reachable.
+/// When this is false the network/checker is down, so probe failures must NOT
+/// be treated as proxy deaths (that used to mass-evict the whole pool).
+pub fn neutralTargetUp(io: std.Io) bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = std.Uri.parse(probe_url) catch return false;
+    var client: HttpClient = .{ .allocator = arena, .io = io };
+    defer client.deinit();
     var req = client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{ .accept_encoding = .{ .override = "identity" } },
@@ -1305,17 +1346,14 @@ test "neutral probe failure drops only after repeated strikes; recovery helps" {
     try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 4001 });
     const route = pool.pick(a).?;
     defer a.free(route.host);
-    // One neutral failure bumps twice but stays under max_fails.
-    pool.reportProbeFailure("127.0.0.1", 4001);
+    // A few neutral failures must NOT drop the route (soft strikes).
+    for (0..3) |_| pool.reportProbeFailure("127.0.0.1", 4001);
     try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
-    // A subsequent success on the neutral probe recovers the score.
-    pool.mu.lock();
-    pool.entries.items[0].fails = 1;
-    pool.mu.unlock();
+    // A subsequent success recovers the score.
     pool.report(route, 5, true);
     try std.testing.expectEqual(@as(u32, 0), pool.entries.items[0].fails);
-    // A second neutral failure reaches max_fails and drops it.
-    pool.reportProbeFailure("127.0.0.1", 4001);
+    // Enough consecutive neutral failures finally drop it.
+    for (0..probe_drop_fail_limit) |_| pool.reportProbeFailure("127.0.0.1", 4001);
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
 }
 
