@@ -37,6 +37,9 @@ pub const egress_throttle_limit: u16 = 5;
 pub const egress_window_ms: i64 = 10 * 60 * 1000;
 pub const max_origin_throttles: u16 = 6;
 pub const origin_throttle_window_ms: i64 = 10 * 60 * 1000;
+pub const origin_breaker_threshold: u8 = 3; // distinct proxies throttled
+pub const origin_breaker_window_ms: i64 = 5 * 1000; // ...within 5 seconds
+pub const origin_breaker_open_ms: i64 = 3 * 1000; // ...then pause 3 seconds
 
 /// One alive proxy. `host` is heap-owned by the pool.
 pub const Entry = struct {
@@ -150,6 +153,19 @@ pub const Pool = struct {
     /// arrived from and counted there.
     egress_throttles: [2048]EgressThrottle = @splat(.{}),
     egress_throttle_next: usize = 0,
+    /// Circuit breaker: when the origin throttles through many DISTINCT
+    /// proxies in a short window, it is rate-limiting this account/region
+    /// through every egress. Stop handing out proxies for a few seconds so
+    /// requests fail fast with the real verdict instead of burning all six
+    /// attempts and slowly retiring the whole pool route by route.
+    origin_breaker_until_ms: i64 = 0,
+    origin_breaker_strikes: u8 = 0,
+    /// Monotonic id of the last throttle that tripped the breaker; distinct
+    /// proxies are counted by remembering which route was throttled last, so
+    /// repeated throttles of the SAME route do not trip it alone.
+    last_breaker_host: [15]u8 = @splat(0),
+    last_breaker_host_len: usize = 0,
+    last_breaker_at_ms: i64 = 0,
 
     const EgressThrottle = struct {
         host: [15]u8 = @splat(0),
@@ -183,6 +199,70 @@ pub const Pool = struct {
             if (slot.count >= egress_throttle_limit and std.mem.eql(u8, slot.host[0..slot.len], host)) return true;
         }
         return false;
+    }
+
+    /// Called on every 429/403 verdict. Returns true when the request should
+    /// stop immediately (the origin is throttling this account through every
+    /// egress); the pool then trips open for a few seconds.
+    pub fn noteOriginThrottle(self: *Pool, host: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const at = self.now();
+        if (at < self.origin_breaker_until_ms) {
+            return true;
+        }
+        const first_seen = self.last_breaker_host_len == 0;
+        const same_host = std.mem.eql(u8, self.last_breaker_host[0..self.last_breaker_host_len], host);
+        const window_expired = at - self.last_breaker_at_ms > origin_breaker_window_ms;
+        if (!first_seen and same_host and !window_expired) {
+            return false; // Same egress as before: retire per-route, not pool-wide.
+        }
+        if (first_seen) {
+            // Baseline: record this host without counting it as evidence yet.
+            self.last_breaker_at_ms = at;
+            self.origin_breaker_strikes = 0;
+            if (host.len <= 15) {
+                self.last_breaker_host_len = host.len;
+                @memcpy(self.last_breaker_host[0..host.len], host);
+            }
+            return false;
+        }
+        // A new distinct host: fresh evidence. A stale window restarts the
+        // count at this host.
+        const strikes: u8 = if (window_expired) 1 else self.origin_breaker_strikes + 1;
+        self.origin_breaker_strikes = strikes;
+        self.last_breaker_at_ms = at;
+        if (host.len <= 15) {
+            self.last_breaker_host_len = host.len;
+            @memcpy(self.last_breaker_host[0..host.len], host);
+        }
+        if (strikes >= origin_breaker_threshold) {
+            self.origin_breaker_until_ms = at + origin_breaker_open_ms;
+            self.origin_breaker_strikes = 0;
+            self.logInfo("proxy pool: origin throttled through {d} distinct proxies; pausing proxied attempts briefly", .{origin_breaker_threshold});
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether the origin-throttle breaker is currently open (the caller
+    /// should not attempt another proxy right now).
+    pub fn originThrottleOpen(self: *Pool) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.now() < self.origin_breaker_until_ms;
+    }
+
+    /// A successful request through a proxy clears the breaker immediately:
+    /// the origin is accepting again. The last throttled host is kept as the
+    /// baseline so a post-success throttle on a DIFFERENT host counts as the
+    /// first fresh strike (instead of being swallowed as a new baseline).
+    pub fn clearOriginThrottle(self: *Pool) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.origin_breaker_until_ms = 0;
+        self.origin_breaker_strikes = 0;
+        self.last_breaker_at_ms = self.now();
     }
 
     pub fn init(alloc: Allocator, io: std.Io) Pool {
@@ -967,6 +1047,38 @@ test "origin that keeps throttling an egress retires routes behind it" {
     pool.routeStatus(route2, 200);
     try std.testing.expect(pool.entries.items[0].preferred);
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items[0].origin_throttles);
+}
+
+test "origin-throttle breaker trips on distinct egresses and opens the pool" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+
+    // Throttling the SAME host repeatedly must not trip the breaker by itself
+    // (one bad proxy is retired per-route, not a pool-wide signal).
+    for (0..10) |_| {
+        try std.testing.expect(!pool.noteOriginThrottle("10.0.0.1"));
+    }
+    try std.testing.expect(!pool.originThrottleOpen());
+
+    // Three DISTINCT egresses throttled in quick succession trip it open
+    // (the threshold is 3 distinct hosts).
+    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.2"));
+    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.3"));
+    try std.testing.expect(pool.noteOriginThrottle("10.0.0.4"));
+    try std.testing.expect(pool.originThrottleOpen());
+
+    // A success clears it.
+    pool.clearOriginThrottle();
+    try std.testing.expect(!pool.originThrottleOpen());
+
+    // A fresh distinct wave re-trips it.
+    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.5"));
+    try std.testing.expect(!pool.noteOriginThrottle("10.0.0.6"));
+    try std.testing.expect(pool.noteOriginThrottle("10.0.0.7"));
+    pool.origin_breaker_until_ms = 0;
+    try std.testing.expect(!pool.originThrottleOpen());
 }
 
 test "probe deadline cancels stalled work" {
