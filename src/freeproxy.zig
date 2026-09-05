@@ -255,21 +255,20 @@ pub const Pool = struct {
     /// origin within the cooldown. Returns the ms to wait (from the origin's
     /// Retry-After when available) for the caller to surface.
     pub fn noteOriginThrottleRoute(self: *Pool, prefix: []const u8, host: []const u8, port: u16, retry_after_ms: u64) i64 {
+        _ = prefix;
         self.mu.lock();
         defer self.mu.unlock();
-        const s = breakerSlot(prefix);
         // Cool THIS route for that origin so we do not burn it again right
         // away; but keep the proxy itself healthy (the origin is the cause).
+        // NOTE: this must NOT extend the per-provider breaker - doing so
+        // would keep the breaker open forever while 429s keep arriving
+        // (each one re-arming the open window), deadlocking the provider.
         const idx = for (self.entries.items, 0..) |item, i| {
             if (item.port == port and std.mem.eql(u8, item.host, host)) break i;
         } else return 0;
         const e = &self.entries.items[idx];
         const cool_ms: i64 = if (retry_after_ms != 0) @min(@as(i64, @intCast(retry_after_ms)), 60_000) else 8_000;
         e.blocked_until_ms = @max(e.blocked_until_ms, self.now() + cool_ms);
-        // Extend the provider breaker by at least the cooldown.
-        if (self.origin_breaker_until_ms[s] != 0) {
-            self.origin_breaker_until_ms[s] = @max(self.origin_breaker_until_ms[s], self.now() + cool_ms);
-        }
         return cool_ms;
     }
 
@@ -1213,6 +1212,37 @@ test "noteOriginThrottleRoute cools the route and honors retry-after" {
     // Origin 429s never drop the route.
     for (0..20) |_| pool.routeStatus(route, 429);
     try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+}
+
+test "repeated route-cooling never keeps the provider breaker open" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 6002 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 0, null);
+    // Simulate the origin 429ing every request for a while: each 429 cools
+    // the route (and trips the breaker a few times), but a route-cooling call
+    // on its own must NEVER extend an already-open breaker into the future.
+    // Trip the breaker first via three distinct hosts.
+    pool.mu.lock();
+    const s = Pool.breakerSlot("p/");
+    pool.origin_breaker_until_ms[s] = 0;
+    pool.mu.unlock();
+    _ = pool.noteOriginThrottle("p/", "10.1.0.1"); // baseline
+    _ = pool.noteOriginThrottle("p/", "10.1.0.2");
+    _ = pool.noteOriginThrottle("p/", "10.1.0.3");
+    const tripped = pool.noteOriginThrottle("p/", "10.1.0.4");
+    try std.testing.expect(tripped);
+    const open_until = pool.origin_breaker_until_ms[Pool.breakerSlot("p/")];
+    // Now cool a route for this provider: must not move the breaker later.
+    _ = pool.noteOriginThrottleRoute("p/", "127.0.0.1", 6002, 0);
+    try std.testing.expectEqual(open_until, pool.origin_breaker_until_ms[Pool.breakerSlot("p/")]);
+    // The breaker still closes on its own once the open window elapses.
+    pool.origin_breaker_until_ms[Pool.breakerSlot("p/")] = 0;
+    try std.testing.expect(!pool.originThrottleOpen("p/"));
 }
 
 test "sources interleave, deduplicate and reject malformed addresses" {
