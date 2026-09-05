@@ -181,6 +181,7 @@ pub const Pool = struct {
     /// Optional anonymous origin catalog check, in addition to neutral TLS.
     /// This proves catalog reachability only. Real completions earn preference.
     probe_origin: []const u8 = "",
+    owned_probe_origin: ?[]u8 = null,
     probe_model: []const u8 = "",
     /// Sustained-demand hint: set by the request path when it has been waiting
     /// for capacity; lets the fetch kick in earlier than the next 5-min list
@@ -281,8 +282,10 @@ pub const Pool = struct {
     /// init with an origin to validate candidates against (see probe_origin).
     pub fn initForOrigin(alloc: Allocator, io: std.Io, origin: []const u8, model: []const u8) Pool {
         var p = Pool.init(alloc, io);
-        p.probe_origin = origin;
-        p.probe_model = model;
+        _ = model;
+        const owned = alloc.dupe(u8, origin) catch return p;
+        p.owned_probe_origin = owned;
+        p.probe_origin = owned;
         return p;
     }
 
@@ -291,6 +294,7 @@ pub const Pool = struct {
         self.stopping = true;
         self.mu.unlock();
         self.tasks.cancel(self.io);
+        if (self.owned_probe_origin) |origin| self.alloc.free(origin);
         for (self.entries.items) |*e| self.alloc.free(e.host);
         self.entries.deinit(self.alloc);
         for (self.candidates.items) |c| self.alloc.free(c.host);
@@ -1548,4 +1552,12 @@ test "first transport failure demotes and cools a formerly preferred route" {
     try std.testing.expect(!pool.entries.items[0].preferred);
     try std.testing.expect(pool.pick(a) == null);
     try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
+}
+
+test "catalog origin survives provider configuration replacement" {
+    var origin = "https://example.com/v1".*;
+    var pool = Pool.initForOrigin(std.testing.allocator, std.testing.io, &origin, "");
+    defer pool.deinit();
+    @memset(&origin, 'x');
+    try std.testing.expectEqualStrings("https://example.com/v1", pool.probe_origin);
 }

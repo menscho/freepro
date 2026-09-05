@@ -70,9 +70,9 @@ class Hop:
   finally:c.close()
  def close(self):self.stop.set();self.server.close()
 def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
- hops=[Hop(m, f"127.0.0.{i+1}") for i,m in enumerate(modes)]
+ hops=[Hop(m) for m in modes]
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
- env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join(f'127.0.0.{i+1}' for i in range(len(hops))),TEST_TIMEOUT=str(timeout))
+ env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join('localhost' if i else '127.0.0.1' for i in range(len(hops))),TEST_TIMEOUT=str(timeout))
  proc=subprocess.Popen([str(binary)],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  try:
   for _ in range(80):
