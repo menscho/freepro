@@ -2757,11 +2757,8 @@ test "static headers ride on upstream requests" {
         var count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
         var stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-        fn run() void {
+        fn run(server: *Net.Server) void {
             const io = sharedIo();
-            const addr = Net.IpAddress.parseIp4(loopback_ip, testPort(18091)) catch return;
-            var server = addr.listen(io, .{}) catch return;
-            defer server.deinit(io);
             while (!stopping.load(.seq_cst)) {
                 const conn = server.accept(io) catch return;
                 serve(conn, io) catch {};
@@ -2811,7 +2808,10 @@ test "static headers ride on upstream requests" {
             return null;
         }
     };
-    var stub_future = std.Io.async(sharedIo(), H.run, .{});
+    const stub_addr = try Net.IpAddress.parseIp4(loopback_ip, testPort(18091));
+    var stub_server = try stub_addr.listen(sharedIo(), .{});
+    defer stub_server.deinit(sharedIo());
+    var stub_future = std.Io.async(sharedIo(), H.run, .{&stub_server});
     defer {
         H.stopping.store(true, .seq_cst);
         pokePortOnPool(testPort(18091));

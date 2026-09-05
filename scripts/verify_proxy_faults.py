@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError
 root=Path(__file__).resolve().parents[1];binary=root/'.verify/proxy-fault-fixture.exe'
+binary.parent.mkdir(parents=True,exist_ok=True)
 args=['zig','build-exe','--dep','engine','-Mroot='+str(root/'scripts/proxy_fault_fixture.zig'),'-Mengine='+str(root/'src/root.zig'),'-femit-bin='+str(binary)]
 args.insert(2,'-lws2_32' if os.name=='nt' else '-lc')
 subprocess.run(args,check=True)
