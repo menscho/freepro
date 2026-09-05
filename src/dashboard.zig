@@ -829,7 +829,7 @@ fn handleStatus(c: *Controller, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
         alloc,
         "{{\"running\":{s},\"port\":{d},\"bound_port\":{d},\"pool_tracked\":{d},\"pool_working\":{s},\"in_flight\":{d}," ++
             "\"total_served\":{d},\"providers\":{d},\"total_keys\":{d},\"healthy_keys\":{d}," ++
-            "\"avg_latency_ms\":{d},\"total_errors\":{d},\"total_failovers\":{d},\"proxies_alive\":{d},\"pool_ready\":{d},\"pool_busy\":{d},\"pool_blocked\":{d},\"pool_waiting\":{d},\"pool_candidates\":{d}}}",
+            "\"avg_latency_ms\":{d},\"total_errors\":{d},\"total_failovers\":{d},\"proxies_alive\":{d},\"pool_ready\":{d},\"pool_busy\":{d},\"pool_blocked\":{d},\"pool_waiting\":{d},\"pool_candidates\":{d},\"active_connections\":{d},\"connection_limit\":{d}}}",
         .{
             if (running) "true" else "false",
             port,
@@ -850,6 +850,8 @@ fn handleStatus(c: *Controller, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
             pool_capacity[2],
             pool_capacity[3],
             pool_capacity[4],
+            c.proxy.activeConnectionCount(),
+            c.proxy.pool_threads,
         },
     ) catch return sendError(writer, 500, "out of memory");
     sendJson(writer, 200, body) catch {};

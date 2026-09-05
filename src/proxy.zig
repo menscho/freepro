@@ -393,7 +393,7 @@ pub const max_models_bytes: usize = 4 * 1024 * 1024;
 pub const max_key_attempts: usize = 64;
 /// Ceiling on concurrent downstream workers; the accept loop back-pressures
 /// past it (see acceptLoop). Clamped to >= 1 in init.
-pub const default_pool_threads: usize = 16;
+pub const default_pool_threads: usize = 128;
 /// The proxy binds loopback only; it is never exposed on LAN interfaces.
 pub const loopback_ip: []const u8 = "127.0.0.1";
 
@@ -535,6 +535,10 @@ pub const Proxy = struct {
     }
 
     /// Total requests handled since init (monotonic).
+    pub fn activeConnectionCount(self: *Proxy) usize {
+        return self.active_workers.load(.seq_cst);
+    }
+
     pub fn totalServedCount(self: *Proxy) u64 {
         return self.total_served.load(.seq_cst);
     }
@@ -724,7 +728,7 @@ pub const Proxy = struct {
             // burst load and stop() can always drain.
             while (self.active_workers.load(.seq_cst) >= self.pool_threads) {
                 if (!self.running.load(.seq_cst)) return;
-                std.Thread.yield() catch {};
+                std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch return;
             }
             const conn = self.acceptOne() catch |err| {
                 if (!self.running.load(.seq_cst)) break;
@@ -970,7 +974,58 @@ pub fn joinUpstreamUrl(alloc: Allocator, base_url: []const u8, endpoint_path: []
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, path });
 }
 
+/// Canceling a pending Windows send alone may wait for the peer forever.
+/// Shutdown interrupts the socket first, then join the operation before freeing it.
+fn socketTimed(comptime T: type, stream: anytype, io: std.Io, ms: u64, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) anyerror!T {
+    const Deadline = struct {
+        fn run(s: @TypeOf(stream), timer_io: std.Io, delay: u64) std.Io.Cancelable!void {
+            try std.Io.sleep(timer_io, .fromMilliseconds(@intCast(delay)), .awake);
+            s.shutdown(timer_io, .both) catch {};
+        }
+    };
+    const Result = union(enum) { result: anyerror!T, deadline: std.Io.Cancelable!void };
+    var buffer: [2]Result = undefined;
+    var select = std.Io.Select(Result).init(io, &buffer);
+    defer _ = select.cancel();
+    errdefer stream.shutdown(io, .both) catch {};
+    try select.concurrent(.deadline, Deadline.run, .{ stream, io, ms });
+    try select.concurrent(.result, func, args);
+    const result = try select.await();
+    while (select.cancel()) |_| {}
+    return switch (result) {
+        .result => |value| value,
+        .deadline => error.Timeout,
+    };
+}
+
+/// Bound every downstream socket write, including dashboard replies and the
+/// final flush. A timed-out writer stays failed so cleanup cannot block again.
+const ClientWriter = struct {
+    interface: std.Io.Writer,
+    sink: *std.Io.Writer,
+    stream: Net.Stream,
+    io: std.Io,
+    timeout_ms: u64,
+    failed: bool = false,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *ClientWriter = @fieldParentPtr("interface", w);
+        if (self.failed) return error.WriteFailed;
+        return socketTimed(usize, self.stream, self.io, self.timeout_ms, write, .{ self, data, splat }) catch {
+            self.failed = true;
+            w.end = 0;
+            return error.WriteFailed;
+        };
+    }
+    fn write(self: *ClientWriter, data: []const []const u8, splat: usize) !usize {
+        try self.sink.writeAll(self.interface.buffer[0..self.interface.end]);
+        self.interface.end = 0;
+        return self.sink.writeSplat(data, splat);
+    }
+};
+
 fn handleConnection(self: *Proxy, stream: Net.Stream) !void {
+    if (builtin.os.tag == .windows) try stream.setTimeouts(self.config.timeout_ms, @min(self.config.timeout_ms, 10_000));
     const t0 = nowMs();
     _ = self.in_flight.fetchAdd(1, .seq_cst);
     var metrics_started = false;
@@ -1009,12 +1064,19 @@ fn handleConnection(self: *Proxy, stream: Net.Stream) !void {
     var rbuf: [8192]u8 = undefined;
     var wbuf: [32768]u8 = undefined;
     var stream_reader = stream.reader(self.io, &rbuf);
-    var stream_writer = stream.writer(self.io, &wbuf);
+    var stream_writer = stream.writer(self.io, &.{});
+    var client_writer: ClientWriter = .{
+        .interface = .{ .vtable = &.{ .drain = ClientWriter.drain }, .buffer = &wbuf },
+        .sink = &stream_writer.interface,
+        .stream = stream,
+        .io = self.io,
+        .timeout_ms = @min(self.config.timeout_ms, 10_000),
+    };
     const reader = &stream_reader.interface;
-    const writer = &stream_writer.interface;
+    const writer = &client_writer.interface;
     defer writer.flush() catch {};
 
-    const raw = readFramedMessage(reader, alloc) catch {
+    const raw = socketTimed([]u8, stream, self.io, self.config.timeout_ms, readFramedMessage, .{ reader, alloc }) catch {
         sendStatus(writer, 400, "malformed http request") catch {};
         status = 400;
         return;
@@ -1632,13 +1694,13 @@ fn forwardAttempt(
     const owned_body = try alloc.dupe(u8, outbound);
     ctx.phase = "upload";
     if (picked_proxy != null) {
-        try freeproxy.timed(void, self.io, try ctx.remaining(self.io, 8000), HttpClient.Request.sendBodyComplete, .{ &req, owned_body });
+        try socketTimed(void, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, 8000), HttpClient.Request.sendBodyComplete, .{ &req, owned_body });
     } else try req.sendBodyComplete(owned_body);
 
     ctx.phase = "response headers";
     var redirect_buf: [512]u8 = undefined;
     var response = if (picked_proxy != null)
-        try freeproxy.timed(HttpClient.Response, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), HttpClient.Request.receiveHead, .{ &req, &redirect_buf })
+        try socketTimed(HttpClient.Response, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), HttpClient.Request.receiveHead, .{ &req, &redirect_buf })
     else
         try req.receiveHead(&redirect_buf);
 
@@ -1666,7 +1728,7 @@ fn forwardAttempt(
                 // Before the first byte, all retries share the request deadline.
                 // Afterwards a live stream has an idle timeout, not a generation limit.
                 const n = if (picked_proxy != null)
-                    try freeproxy.timed(usize, self.io, if (started) self.config.timeout_ms else try ctx.remaining(self.io, self.config.timeout_ms), readChunk, .{ reader, &chunk })
+                    try socketTimed(usize, req.connection.?.stream_reader.stream, self.io, if (started) self.config.timeout_ms else try ctx.remaining(self.io, self.config.timeout_ms), readChunk, .{ reader, &chunk })
                 else
                     try readChunk(reader, &chunk);
                 if (n == 0) break;
@@ -1702,7 +1764,7 @@ fn forwardAttempt(
             sendSseEnd(writer) catch return error.ClientDisconnected;
         } else {
             const raw_body = if (picked_proxy != null)
-                try freeproxy.timed([]u8, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), bufferUpstreamBody, .{ reader, alloc, max_body_bytes })
+                try socketTimed([]u8, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), bufferUpstreamBody, .{ reader, alloc, max_body_bytes })
             else
                 try bufferUpstreamBody(reader, alloc, max_body_bytes);
             if (raw_body.len == 0) return error.EmptyUpstreamResponse;
@@ -1730,7 +1792,7 @@ fn forwardAttempt(
     }
 
     const err_body = (if (picked_proxy != null)
-        freeproxy.timed([]u8, self.io, try ctx.remaining(self.io, 8000), bufferUpstreamBody, .{ reader, alloc, max_upstream_error_bytes })
+        socketTimed([]u8, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, 8000), bufferUpstreamBody, .{ reader, alloc, max_upstream_error_bytes })
     else
         bufferUpstreamBody(reader, alloc, max_upstream_error_bytes)) catch |err| {
         if (err == ProxyError.BodyTooLarge) return .{ .status = status, .body = &.{} };
@@ -1898,6 +1960,7 @@ fn handleCompletions(
     }
 
     if (!tried_any) {
+        if (self.logger) |l| l.warn("no eligible API key for provider {s}, model {s}; request did not reach public proxy selection", .{ prov.prefix, ms.model });
         try sendStatus(writer, 503, "all API keys for this provider are exhausted or cooling down");
         return 503;
     }

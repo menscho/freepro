@@ -48,10 +48,10 @@ class Hop:
     if self.mode=='stream-ok':frame+=b'data: [DONE]\n\n'
     c.sendall(f'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {len(frame)}\r\n\r\n'.encode()+frame)
     return
-   if self.mode=='client-close':
+   if self.mode in ['client-close','client-stall']:
     c.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n')
     frame=b'data: {"choices":[{"delta":{"content":"'+b'x'*16000+b'"}}]}\n\n'
-    for _ in range(200):c.sendall(f'{len(frame):x}\r\n'.encode()+frame+b'\r\n')
+    for _ in range(5000 if self.mode=='client-stall' else 200):c.sendall(f'{len(frame):x}\r\n'.encode()+frame+b'\r\n')
     return
    if self.mode in ['stream-cut','stream-idle']:
     c.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 9000\r\n\r\ndata: {"choices":[{"delta":{"content":"partial"}}]}\n\n');self.stop.wait(5) if self.mode=='stream-idle' else time.sleep(.1);return

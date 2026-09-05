@@ -41,6 +41,7 @@ extern "ws2_32" fn accept(s: SOCKET, addr: ?*SockAddrIn, addrlen: ?*c_int) callc
 extern "ws2_32" fn connect(s: SOCKET, addr: *const SockAddrIn, namelen: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn shutdown(s: SOCKET, how: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
 extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: *WSADATA) callconv(.winapi) c_int;
@@ -56,6 +57,10 @@ fn wsAccept(s: SOCKET) SOCKET {
 
 fn wsConnect(s: SOCKET, addr: *const SockAddrIn) c_int {
     return connect(s, addr, @sizeOf(SockAddrIn));
+}
+
+fn wsShutdown(s: SOCKET, how: c_int) c_int {
+    return shutdown(s, how);
 }
 
 const WSADATA = extern struct {
@@ -228,6 +233,24 @@ pub const Stream = struct {
             },
             .err = null,
         };
+    }
+
+    /// Winsock calls are blocking and do not observe std.Io cancellation.
+    /// OS deadlines are required even when the caller also races an Io timer.
+    pub fn setTimeouts(s: Stream, receive_ms: u32, send_ms: u32) !void {
+        if (setsockopt(s.sock, SOL_SOCKET, ws2.SO.RCVTIMEO, @ptrCast(&receive_ms), @sizeOf(u32)) != 0 or
+            setsockopt(s.sock, SOL_SOCKET, ws2.SO.SNDTIMEO, @ptrCast(&send_ms), @sizeOf(u32)) != 0)
+            return error.SocketTimeoutSetupFailed;
+    }
+
+    pub fn shutdown(s: *const Stream, io: Io, how: Io.net.ShutdownHow) !void {
+        _ = io;
+        const direction: c_int = switch (how) {
+            .recv => 0,
+            .send => 1,
+            .both => 2,
+        };
+        if (wsShutdown(s.sock, direction) != 0) return error.SocketShutdownFailed;
     }
 
     pub fn close(s: *const Stream, io: Io) void {

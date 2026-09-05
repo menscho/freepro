@@ -24,12 +24,14 @@ fn stopwatchStartMs() i64 {
     return nowMs();
 }
 
-pub const max_pool: usize = 64;
-pub const max_latency_ms: u64 = 6000;
+pub const max_pool: usize = 256;
+pub const max_latency_ms: u64 = 4000;
 pub const max_fails: u32 = 1;
 pub const list_refresh_ms: i64 = 15 * 60 * 1000; // re-pull lists every 15 min
 pub const validation_refresh_ms: i64 = 60 * 1000; // re-validate idle routes every minute
-pub const max_validate_batch: usize = 96;
+pub const validation_workers: usize = 32;
+pub const target_ready: usize = 96;
+pub const max_validate_batch: usize = 512;
 
 /// One alive proxy. `host` is heap-owned by the pool.
 pub const Entry = struct {
@@ -59,6 +61,8 @@ const list_sources = [_][]const u8{
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
 };
 
 /// Validate HTTPS tunneling against the OpenCode catalog, without credentials.
@@ -91,10 +95,13 @@ pub const Pool = struct {
     working: bool = false,
     refresh_started_ms: i64 = 0,
     waiting: usize = 0,
+    wait_tickets: [128]u64 = @splat(0),
+    next_ticket: u64 = 0,
+    refresh_checked_ms: i64 = 0,
     candidates: CandidateList = .empty,
     candidate_cursor: usize = 0,
     clock: u64 = 0,
-    quarantine: [128]struct { host: [15]u8 = @splat(0), len: usize = 0, port: u16 = 0, until: i64 = 0 } = @splat(.{}),
+    quarantine: [1024]struct { host: [15]u8 = @splat(0), len: usize = 0, port: u16 = 0, until: i64 = 0 } = @splat(.{}),
     quarantine_next: usize = 0,
     last_refresh_error: []const u8 = "",
     /// Optional message sink (already-formatted string). Stringify at the call site.
@@ -136,7 +143,8 @@ pub const Pool = struct {
         return self.pickAvoiding(arena, &.{});
     }
     fn quarantined(self: *Pool, host: []const u8, port: u16) bool {
-        for (self.quarantine) |q| if (q.until > self.now() and q.port == port and std.mem.eql(u8, q.host[0..q.len], host)) return true;
+        const at = self.now();
+        for (self.quarantine) |q| if (q.until > at and q.port == port and std.mem.eql(u8, q.host[0..q.len], host)) return true;
         return false;
     }
     fn quarantineRoute(self: *Pool, host: []const u8, port: u16) void {
@@ -151,6 +159,10 @@ pub const Pool = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.waiting != 0) return null;
+        return self.pickLocked(arena, avoided);
+    }
+    fn pickLocked(self: *Pool, arena: Allocator, avoided: []const Picked) ?Picked {
         var best: ?usize = null;
         var best_latency: u32 = std.math.maxInt(u32);
         var best_used: u64 = std.math.maxInt(u64);
@@ -196,29 +208,46 @@ pub const Pool = struct {
     /// Wait for a lease or new validation within the caller's existing budget.
     /// Bound admission so arbitrary bursts cannot create an unlimited queue.
     pub fn waitForRoute(self: *Pool, arena: Allocator, avoided: []const Picked, budget_ms: u64) !?Picked {
-        if (self.pickAvoiding(arena, avoided)) |picked| return picked;
+        self.maybeRefresh();
         self.mu.lock();
-        if (self.waiting >= 128) {
+        if (self.waiting == 0) {
+            if (self.pickLocked(arena, avoided)) |picked| {
+                self.mu.unlock();
+                return picked;
+            }
+        }
+        if (self.waiting == self.wait_tickets.len) {
             self.mu.unlock();
             return null;
         }
+        const ticket = self.next_ticket;
+        self.next_ticket +%= 1;
+        self.wait_tickets[self.waiting] = ticket;
         self.waiting += 1;
         self.mu.unlock();
         defer {
             self.mu.lock();
-            self.waiting -= 1;
+            for (self.wait_tickets[0..self.waiting], 0..) |old, i| {
+                if (old != ticket) continue;
+                std.mem.copyForwards(u64, self.wait_tickets[i .. self.waiting - 1], self.wait_tickets[i + 1 .. self.waiting]);
+                self.waiting -= 1;
+                break;
+            }
             self.mu.unlock();
         }
         const end = std.Io.Clock.awake.now(self.io).toMilliseconds() + @as(i64, @intCast(budget_ms));
         while (std.Io.Clock.awake.now(self.io).toMilliseconds() < end) {
             self.mu.lock();
+            const first = self.wait_tickets[0] == ticket;
+            const picked = if (first) self.pickLocked(arena, avoided) else null;
             const pending = !self.stopping or self.working or for (self.entries.items) |e| {
                 if (e.in_flight) break true;
             } else false;
             self.mu.unlock();
-            if (!pending) return self.pickAvoiding(arena, avoided);
-            try std.Io.sleep(self.io, .fromMilliseconds(25), .awake);
-            if (self.pickAvoiding(arena, avoided)) |picked| return picked;
+            if (picked != null) return picked;
+            if (first and !pending) return null;
+            if (first) self.maybeRefresh();
+            try std.Io.sleep(self.io, .fromMilliseconds(5), .awake);
         }
         return null;
     }
@@ -318,9 +347,11 @@ pub const Pool = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.stopping or self.working) return;
+        if (self.now() - self.refresh_checked_ms < 1000) return;
+        self.refresh_checked_ms = self.now();
         const stale = self.now() - self.pool_validated_ms > validation_refresh_ms or
             self.now() - self.lists_fetched_ms > list_refresh_ms or
-            (self.readyCount() < 16 and self.now() - self.refresh_started_ms >= 5000);
+            (self.now() - self.refresh_started_ms >= 5000 and self.readyCount() < target_ready);
         if (!stale) return;
         const ctx = self.alloc.create(RefreshCtx) catch return;
         ctx.* = .{ .pool = self };
@@ -404,20 +435,32 @@ pub const Pool = struct {
                 };
             }
         };
-        var offset: usize = 0;
-        while (offset < fresh.items.len) : (offset += 24) {
-            try std.Io.checkCancel(pool.io);
-            var group: std.Io.Group = .init;
-            defer group.cancel(pool.io);
-            for (fresh.items[offset..@min(offset + 24, fresh.items.len)]) |cand| {
-                group.concurrent(pool.io, Job.run, .{Job{ .pool = pool, .candidate = cand }}) catch break;
+        // Workers take another candidate immediately after finishing a probe;
+        // a slow endpoint no longer stalls a whole batch of fast validators.
+        const Work = struct {
+            pool: *Pool,
+            candidates: []const Candidate,
+            cursor: std.atomic.Value(usize) = .init(0),
+            fn run(work: *@This()) std.Io.Cancelable!void {
+                while (true) {
+                    try std.Io.checkCancel(work.pool.io);
+                    const i = work.cursor.fetchAdd(1, .monotonic);
+                    if (i >= work.candidates.len) return;
+                    work.pool.mu.lock();
+                    const enough = work.pool.readyCount() >= target_ready;
+                    work.pool.mu.unlock();
+                    if (enough and i >= max_pool) return;
+                    Job.run(.{ .pool = work.pool, .candidate = work.candidates[i] });
+                }
             }
-            try group.await(pool.io);
-            pool.mu.lock();
-            const enough = pool.readyCount() >= 32;
-            pool.mu.unlock();
-            if (enough and offset + 24 >= max_pool) break;
+        };
+        var work: Work = .{ .pool = pool, .candidates = fresh.items };
+        var validators: std.Io.Group = .init;
+        defer validators.cancel(pool.io);
+        for (0..@min(validation_workers, fresh.items.len)) |_| {
+            validators.concurrent(pool.io, Work.run, .{&work}) catch break;
         }
+        try validators.await(pool.io);
         pool.mu.lock();
         var stale_index: usize = 0;
         while (stale_index < pool.entries.items.len) {
@@ -429,7 +472,8 @@ pub const Pool = struct {
         pool.pool_validated_ms = pool.now();
         pool.last_refresh_error = if (pool.entries.items.len == 0) "no public proxy passed HTTPS validation" else "";
         pool.mu.unlock();
-        pool.logInfo("proxy pool: {d} HTTPS-validated proxies", .{pool.alive()});
+        const capacity = pool.diag();
+        pool.logInfo("proxy pool: {d} validated, {d} ready (target {d}; {d} cached candidates)", .{ pool.alive(), capacity.ready, target_ready, capacity.candidates });
     }
 
     const Candidate = struct {
@@ -481,7 +525,7 @@ pub const Pool = struct {
             if (pool.now() - e.validated_ms < validation_refresh_ms) continue;
             try out.append(alloc, .{ .host = try alloc.dupe(u8, e.host), .port = e.port });
         }
-        const count = @min(pool.candidates.items.len, 192);
+        const count = @min(pool.candidates.items.len, max_validate_batch);
         for (0..count) |_| {
             const c = pool.candidates.items[pool.candidate_cursor % pool.candidates.items.len];
             pool.candidate_cursor += 1;
@@ -510,7 +554,7 @@ pub const Pool = struct {
             while (keys.next()) |key| alloc.free(key.*);
             seen.deinit();
         }
-        while (out.items.len < 6000) {
+        while (out.items.len < 12000) {
             var more = false;
             for (bodies, 0..) |body, i| {
                 const bytes = body orelse continue;
@@ -768,7 +812,7 @@ test "refills advance through cached candidates without fetching lists" {
     defer pool.deinit();
     pool.stopping = true;
     pool.lists_fetched_ms = nowMs();
-    for (0..300) |i| try pool.candidates.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = @intCast(i + 1) });
+    for (0..800) |i| try pool.candidates.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = @intCast(i + 1) });
     var first = try Pool.fetchLists(&pool, a);
     defer {
         for (first.items) |c| a.free(c.host);
@@ -780,7 +824,7 @@ test "refills advance through cached candidates without fetching lists" {
         next.deinit(a);
     }
     try std.testing.expectEqual(@as(u16, 1), first.items[0].port);
-    try std.testing.expectEqual(@as(u16, 193), next.items[0].port);
+    try std.testing.expectEqual(@as(u16, 513), next.items[0].port);
 }
 
 test "queued request acquires released lease without concurrent reuse" {
@@ -821,4 +865,20 @@ test "queue timeout releases admission without losing an active route" {
     try std.testing.expect(pool.entries.items[0].in_flight);
     pool.report(held, 0, null);
     try std.testing.expectEqual(@as(usize, 1), pool.readyCount());
+}
+
+test "new callers cannot bypass queued tickets when a route becomes free" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 20 });
+    pool.waiting = 1;
+    pool.wait_tickets[0] = 5;
+    try std.testing.expect(pool.pick(a) == null);
+    try std.testing.expect(!pool.entries.items[0].in_flight);
+    pool.waiting = 0;
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 0, null);
 }

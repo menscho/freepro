@@ -6,7 +6,7 @@
 
 A lightweight model proxy with an OpenAI-compatible API, automatic key rotation, and a compact dark dashboard.
 
-[Download v0.1.2](https://github.com/menscho/freepro/releases/tag/v0.1.2) · [Getting started](#getting-started) · [Build from source](#build-from-source)
+[Download v0.1.3](https://github.com/menscho/freepro/releases/tag/v0.1.3) · [Getting started](#getting-started) · [Build from source](#build-from-source)
 
 ![Version](https://img.shields.io/github/v/release/menscho/freepro?style=flat-square&color=879fff)
 ![License](https://img.shields.io/github/license/menscho/freepro?style=flat-square&color=879fff)
@@ -25,7 +25,7 @@ A lightweight model proxy with an OpenAI-compatible API, automatic key rotation,
 - **Model library:** choose which models clients can see, filter paid models, and configure reasoning levels.
 - **Usage you can inspect:** input, output, cached tokens, model breakdowns, daily history, and CSV export.
 - **Kimi Code setup:** add or update the local configuration with one button, then run `/reload`.
-- **Optional public proxy routing:** configure it per provider. Candidates must pass HTTPS CONNECT, TLS and complete catalog validation. Nine sources feed a rotating candidate cache; fast successful routes are reused, with one active request per route and quarantine after failure. Bursts can queue for up to eight seconds within the request timeout (128 waiters maximum), while a background refill replaces unavailable capacity. Repeated 403/429 responses increase route cooldowns. Catalog access alone cannot guarantee a generation request will be accepted. Retries share the configured timeout; a partial stream is never replayed. This feature is experimental; proxy availability and upstream limits still apply.
+- **Optional public proxy routing:** configure it per provider. Candidates must pass HTTPS CONNECT, TLS and complete catalog validation. Eleven sources feed a rotating cache of up to 12,000 candidates; fast successful routes are reused, with one active request per route and quarantine after failure. 32 continuous validators target 96 ready routes (256 maximum), admitting only candidates that pass complete validation within four seconds. Bursts queue first-come-first-served for up to eight seconds within the request timeout (128 waiters maximum), while a background refill replaces unavailable capacity. Repeated 403/429 responses increase route cooldowns. Catalog access alone cannot guarantee a generation request will be accepted. The local server supports 128 connections, with inbound and downstream write deadlines to release abandoned clients. Retries share the configured timeout; a partial stream is never replayed. This feature is experimental; proxy availability and upstream limits still apply.
 - **Updates on your terms:** check GitHub once at startup; show an Update button only when a newer compatible release is available.
 
 The GUI is served locally and opens in your browser. Its HTML, styles, scripts, and logo are embedded in the executable—no Node.js server or frontend installation is needed.
@@ -34,13 +34,13 @@ The GUI is served locally and opens in your browser. Its HTML, styles, scripts, 
 
 | Platform | Standalone download |
 | --- | --- |
-| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.2/freepro-v0.1.2-windows-x86_64.exe) |
-| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.2/freepro-v0.1.2-linux-x86_64) |
-| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.2/freepro-v0.1.2-linux-arm64) |
-| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.2/freepro-v0.1.2-macos-arm64) |
-| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.2/freepro-v0.1.2-macos-x86_64) |
+| Windows 10/11 · x64 | [freepro.exe](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-windows-x86_64.exe) |
+| Linux · x64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-linux-x86_64) |
+| Linux · ARM64 | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-linux-arm64) |
+| macOS · Apple Silicon | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-macos-arm64) |
+| macOS · Intel | [freepro](https://github.com/menscho/freepro/releases/download/v0.1.3/freepro-v0.1.3-macos-x86_64) |
 
-Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.2/SHA256SUMS).
+Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds are unsigned command-line executables that launch the browser GUI; macOS may require approval in **System Settings → Privacy & Security**. Release checksums are available in [SHA256SUMS](https://github.com/menscho/freepro/releases/download/v0.1.3/SHA256SUMS).
 
 ## Getting started
 
@@ -48,8 +48,8 @@ Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds
 2. On Windows, launch the `.exe`. On Linux or macOS, make the download executable and run it:
 
    ```sh
-   chmod +x ./freepro-v0.1.2-linux-x86_64
-   ./freepro-v0.1.2-linux-x86_64
+   chmod +x ./freepro-v0.1.3-linux-x86_64
+   ./freepro-v0.1.3-linux-x86_64
    ```
 
    Substitute your downloaded filename on macOS or ARM64.
