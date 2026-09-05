@@ -28,8 +28,8 @@ class Hop:
    threading.Thread(target=self.serve,args=(c,),daemon=True).start()
  def serve(self,c):
   try:
-   c.settimeout(5);request=head(c);assert request.startswith(b'CONNECT origin.invalid:80 '),request
-   self.seen+=1
+   c.settimeout(5);request=head(c);self.seen+=1
+   assert request.startswith(b'CONNECT origin.invalid:80 '),request
    if self.mode=='connect-stall':self.stop.wait(5);return
    c.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
    if self.mode=='upload-stall':self.stop.wait(5);return
