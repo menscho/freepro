@@ -1718,11 +1718,9 @@ fn forwardAttempt(
     var picked_proxy: ?freeproxy.Picked = null;
     if (self.free_proxies) |pool| {
         if (prov.use_free_proxy) {
-            // The origin-throttle breaker for THIS provider is open: the
-            // origin just rejected several distinct egresses, so a new
-            // attempt would only burn time against the same wall. Fail fast
-            // with the real verdict.
-            if (pool.originThrottleOpen(prov.prefix)) return error.OriginThrottled;
+            // A few rejected egresses do not justify pausing fresh routes.
+            // Only stop when the breaker is open AND no eligible route remains.
+            if (pool.originThrottleBlocks(prov.prefix)) return error.OriginThrottled;
             pool.noteDemand();
             ctx.phase = "waiting for public proxy";
             // Wait for busy healthy routes within bounded admission and the
@@ -1991,8 +1989,8 @@ fn handleCompletions(
             }
             if (err == ProxyError.OriginThrottled) {
                 // The breaker was already open when this attempt started.
-                if (self.logger) |l| l.warn("public proxy attempt skipped: origin still rate-limiting (429/403 seen across egresses)", .{});
-                try sendStatus(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly");
+                if (self.logger) |l| l.warn("public proxy attempt skipped: all eligible routes cooling after upstream 429/403 responses", .{});
+                try sendStatus(writer, 429, "available public proxy routes are cooling after upstream rate limits; try again shortly");
                 return 429;
             }
             if (err == ProxyError.FreeProxyUnavailable) {
@@ -2072,10 +2070,10 @@ fn handleCompletions(
                     const port = outcome.proxy_port;
                     const retry_ms = outcome.retry_after_ms;
                     const cool_ms = pool.noteOriginThrottleRoute(prov.prefix, host, port, retry_ms);
-                    if (pool.noteOriginThrottle(prov.prefix, host)) {
+                    if (pool.noteOriginThrottle(prov.prefix, host) and pool.originThrottleBlocks(prov.prefix)) {
                         if (self.metrics) |m| m.noteFailover();
                         const wait_ms: u64 = if (retry_ms != 0) retry_ms else @intCast(@max(cool_ms, 1000));
-                        try sendStatusRetryAfter(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly", @max(1, wait_ms / 1000));
+                        try sendStatusRetryAfter(writer, 429, "available public proxy routes are cooling after upstream rate limits; try again shortly", @max(1, wait_ms / 1000));
                         return 429;
                     }
                 }

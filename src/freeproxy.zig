@@ -205,7 +205,7 @@ pub const Pool = struct {
 
     /// Called on every 429/403 verdict for `prefix`'s origin. Returns true
     /// when the request should stop immediately (the origin is throttling
-    /// this account through many egresses); that provider's breaker then
+    /// several observed routes); that provider's breaker then
     /// trips open briefly. This NEVER deletes or retires a route: the
     /// origin's mood is not the proxy's health.
     pub fn noteOriginThrottle(self: *Pool, prefix: []const u8, host: []const u8) bool {
@@ -239,6 +239,21 @@ pub const Pool = struct {
         self.mu.lock();
         defer self.mu.unlock();
         return self.now() < self.origin_breaker_until_ms[breakerSlot(prefix)];
+    }
+
+    /// Rejections on a few routes do not prove that every egress is throttled.
+    /// Keep trying (or queue for a busy route) while eligible capacity remains.
+    pub fn originThrottleBlocks(self: *Pool, prefix: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const at = self.now();
+        if (at >= self.origin_breaker_until_ms[breakerSlot(prefix)]) return false;
+        for (self.entries.items) |e| {
+            if (e.fails >= max_fails or e.blocked_until_ms > at or self.quarantined(e.host, e.port)) continue;
+            if (e.validated_ms != 0 and at - e.validated_ms > 2 * validation_refresh_ms) continue;
+            return false; // Busy eligible routes can still become available.
+        }
+        return true;
     }
 
     /// A successful request for `prefix` through a proxy clears its breaker.
@@ -1560,4 +1575,23 @@ test "catalog origin survives provider configuration replacement" {
     defer pool.deinit();
     @memset(&origin, 'x');
     try std.testing.expectEqualStrings("https://example.com/v1", pool.probe_origin);
+}
+
+test "throttle breaker does not block a fresh or busy eligible route" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "198.51.100.8"), .port = 8080 });
+    _ = pool.noteOriginThrottle("oc/", "10.0.0.1");
+    _ = pool.noteOriginThrottle("oc/", "10.0.0.2");
+    try std.testing.expect(pool.noteOriginThrottle("oc/", "10.0.0.3"));
+    try std.testing.expect(pool.originThrottleOpen("oc/"));
+    try std.testing.expect(!pool.originThrottleBlocks("oc/"));
+    const held = pool.pick(a).?;
+    defer a.free(held.host);
+    try std.testing.expect(!pool.originThrottleBlocks("oc/"));
+    pool.routeStatus(held, 429);
+    pool.report(held, 0, null);
+    try std.testing.expect(pool.originThrottleBlocks("oc/"));
 }

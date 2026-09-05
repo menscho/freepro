@@ -69,10 +69,10 @@ class Hop:
   except OSError:pass
   finally:c.close()
  def close(self):self.stop.set();self.server.close()
-def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
+def run(modes,timeout=1600,stream=False,large=False,disconnect=False,pretrip=False):
  hops=[Hop(m) for m in modes]
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
- env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join('localhost' if i else '127.0.0.1' for i in range(len(hops))),TEST_TIMEOUT=str(timeout))
+ env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join('localhost' if i else '127.0.0.1' for i in range(len(hops))),TEST_TIMEOUT=str(timeout),TEST_PRETRIP="1" if pretrip else "0")
  proc=subprocess.Popen([str(binary)],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  try:
   for _ in range(80):
@@ -115,6 +115,10 @@ if __name__=='__main__':
  raw,elapsed,seen,state=run(['throttle','ok'])
  assert raw.startswith(b'HTTP/1.1 200') and seen==[1,1] and elapsed<1.5,(raw,elapsed,seen,state)
  print('PASS 429 recovers without a synchronous neutral probe, within the shared deadline')
+ raw,elapsed,seen,state=run(['throttle','ok'],pretrip=True)
+ assert raw.startswith(b'HTTP/1.1 200') and seen==[1,1],(raw,seen,state)
+ print('PASS earlier throttled routes do not block recovery through an eligible route')
+
 
  for broken in ['reset','truncated','head-stall','body-stall']:
   raw,elapsed,seen,state=run([broken,'ok']);assert raw.startswith(b'HTTP/1.1 200'),raw[:400];assert seen==[1,1],seen;assert elapsed<3,(broken,elapsed)

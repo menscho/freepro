@@ -21,6 +21,11 @@ pub fn main(init: std.process.Init) !void {
     }
     var keys = [_]engine.models.Key{.{ .key = "fixture-key" }};
     var providers = [_]engine.models.Provider{.{ .display_name = "Fixture", .base_url = "http://origin.invalid/v1/", .prefix = "test/", .description = "fixture", .keys = &keys, .headers = &.{}, .use_free_proxy = true }};
+    if (std.mem.eql(u8, init.environ_map.get("TEST_PRETRIP") orelse "0", "1")) {
+        _ = pool.noteOriginThrottle("test/", "10.0.0.1");
+        _ = pool.noteOriginThrottle("test/", "10.0.0.2");
+        _ = pool.noteOriginThrottle("test/", "10.0.0.3");
+    }
     var config: engine.models.ProxyConfig = .{ .port = try std.fmt.parseInt(u16, init.environ_map.get("TEST_PORT").?, 10), .timeout_ms = try std.fmt.parseInt(u32, init.environ_map.get("TEST_TIMEOUT").?, 10), .providers = &providers };
     var rotator = try engine.rotator.Rotator.init(init.gpa, &config);
     defer rotator.deinit();
