@@ -1,7 +1,7 @@
 """Package the five GUI builds produced by zig build release-all."""
 import hashlib,shutil,sys
 from pathlib import Path
-VERSION="0.1.1"
+VERSION="0.1.2"
 source=Path(sys.argv[1]) if len(sys.argv)>1 else Path("zig-out/bin")
 out=Path(sys.argv[2]) if len(sys.argv)>2 else Path("release")
 out.mkdir(parents=True,exist_ok=True)

@@ -1567,7 +1567,8 @@ fn forwardAttempt(
     if (self.free_proxies) |pool| {
         if (prov.use_free_proxy) {
             pool.maybeRefresh();
-            picked_proxy = pool.pickAvoiding(alloc, ctx.routes.items);
+            ctx.phase = "waiting for public proxy";
+            picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 8000));
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
         }
     }
@@ -1812,13 +1813,17 @@ fn handleCompletions(
                 return 502; // Close the stream, never append another HTTP response.
             }
             if (err == ProxyError.FreeProxyUnavailable) {
-                // Pool still warming / exhausted: not the key's fault. Fail
-                // the request without touching key health.
+                // Capacity wait expired or the bounded queue is full.
+                // Preserve key health and expose why no route was available.
+                if (self.free_proxies) |pool| {
+                    const capacity = pool.diag();
+                    if (self.logger) |l| l.warn("public proxy capacity unavailable: {d} ready, {d} busy, {d} blocked, {d} waiting (API keys unchanged)", .{ capacity.ready, capacity.busy, capacity.blocked, capacity.waiting });
+                }
                 if (last_body.len != 0) {
                     try sendJson(writer, last_status, last_body);
                     return last_status;
                 }
-                try sendStatus(writer, 503, "public proxy routes are busy or unavailable; the pool is refreshing (API keys unchanged)");
+                try sendStatus(writer, 503, "no eligible public proxy became available within the queue budget, or the queue is full (API keys unchanged)");
                 return 503;
             }
             if (!ms_free_proxy) self.reportKey(p_idx, key_idx, null);
@@ -3063,6 +3068,7 @@ test "public proxy transport failures do not cool or kill API keys" {
     const a = std.testing.allocator;
     var pool = freeproxy.Pool.init(a, sharedIo());
     defer pool.deinit();
+    pool.stopping = true; // Deterministic fixtures must never fetch public lists.
     pool.lists_fetched_ms = nowMs();
     pool.pool_validated_ms = nowMs();
     try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 1 });

@@ -28,7 +28,7 @@ pub const max_pool: usize = 64;
 pub const max_latency_ms: u64 = 6000;
 pub const max_fails: u32 = 1;
 pub const list_refresh_ms: i64 = 15 * 60 * 1000; // re-pull lists every 15 min
-pub const validation_refresh_ms: i64 = 60 * 1000; // re-validate pool every 5 min
+pub const validation_refresh_ms: i64 = 60 * 1000; // re-validate idle routes every minute
 pub const max_validate_batch: usize = 96;
 
 /// One alive proxy. `host` is heap-owned by the pool.
@@ -42,18 +42,23 @@ pub const Entry = struct {
     preferred: bool = false,
     in_flight: bool = false,
     blocked_until_ms: i64 = 0,
+    throttle_strikes: u8 = 0,
     validated_ms: i64 = 0,
 };
 
 /// Public sources. All return plain `ip:port` text lists and refresh
 /// upstream on their own cadence (minutes), so a plain re-fetch is a fresh
-/// list. Checked: all four respond without auth.
+/// list. Sources are merged fairly; one large list cannot hide the rest.
 const list_sources = [_][]const u8{
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000",
     "https://www.proxy-list.download/api/v1/get?type=http",
     "https://proxyspace.pro/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
 };
 
 /// Validate HTTPS tunneling against the OpenCode catalog, without credentials.
@@ -84,6 +89,10 @@ pub const Pool = struct {
     lists_fetched_ms: i64 = 0,
     pool_validated_ms: i64 = 0,
     working: bool = false,
+    refresh_started_ms: i64 = 0,
+    waiting: usize = 0,
+    candidates: CandidateList = .empty,
+    candidate_cursor: usize = 0,
     clock: u64 = 0,
     quarantine: [128]struct { host: [15]u8 = @splat(0), len: usize = 0, port: u16 = 0, until: i64 = 0 } = @splat(.{}),
     quarantine_next: usize = 0,
@@ -102,6 +111,8 @@ pub const Pool = struct {
         self.tasks.cancel(self.io);
         for (self.entries.items) |*e| self.alloc.free(e.host);
         self.entries.deinit(self.alloc);
+        for (self.candidates.items) |c| self.alloc.free(c.host);
+        self.candidates.deinit(self.alloc);
     }
 
     fn logInfo(self: *Pool, comptime fmt: []const u8, args: anytype) void {
@@ -153,8 +164,8 @@ pub const Pool = struct {
             if (e.validated_ms != 0 and self.now() - e.validated_ms > 2 * validation_refresh_ms) continue;
             // Prefer fast; tie-break on least-recently-used.
             const better = best == null or (e.preferred and !best_preferred) or
-                (e.preferred == best_preferred and (e.last_used < best_used or
-                    (e.last_used == best_used and e.latency_ms < best_latency)));
+                (e.preferred == best_preferred and (e.latency_ms < best_latency or
+                    (e.latency_ms == best_latency and e.last_used < best_used)));
             if (better) {
                 best = i;
                 best_preferred = e.preferred;
@@ -171,6 +182,47 @@ pub const Pool = struct {
         return .{ .host = host, .port = e.port, .index = idx, .leased = true };
     }
 
+    // Called with the pool mutex held. Busy and blocked entries are not capacity.
+    fn readyCount(self: *Pool) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (!e.in_flight and e.fails < max_fails and e.blocked_until_ms <= self.now() and
+                (e.validated_ms == 0 or self.now() - e.validated_ms <= 2 * validation_refresh_ms) and
+                !self.quarantined(e.host, e.port)) n += 1;
+        }
+        return n;
+    }
+
+    /// Wait for a lease or new validation within the caller's existing budget.
+    /// Bound admission so arbitrary bursts cannot create an unlimited queue.
+    pub fn waitForRoute(self: *Pool, arena: Allocator, avoided: []const Picked, budget_ms: u64) !?Picked {
+        if (self.pickAvoiding(arena, avoided)) |picked| return picked;
+        self.mu.lock();
+        if (self.waiting >= 128) {
+            self.mu.unlock();
+            return null;
+        }
+        self.waiting += 1;
+        self.mu.unlock();
+        defer {
+            self.mu.lock();
+            self.waiting -= 1;
+            self.mu.unlock();
+        }
+        const end = std.Io.Clock.awake.now(self.io).toMilliseconds() + @as(i64, @intCast(budget_ms));
+        while (std.Io.Clock.awake.now(self.io).toMilliseconds() < end) {
+            self.mu.lock();
+            const pending = !self.stopping or self.working or for (self.entries.items) |e| {
+                if (e.in_flight) break true;
+            } else false;
+            self.mu.unlock();
+            if (!pending) return self.pickAvoiding(arena, avoided);
+            try std.Io.sleep(self.io, .fromMilliseconds(25), .awake);
+            if (self.pickAvoiding(arena, avoided)) |picked| return picked;
+        }
+        return null;
+    }
+
     /// Report the outcome of using a proxy. Success keeps it (EMA latency);
     /// failure bumps strikes and drops it at max_fails. Fast: O(1) lock.
     pub fn report(self: *Pool, picked: Picked, latency_ms: u32, ok: ?bool) void {
@@ -185,7 +237,8 @@ pub const Pool = struct {
         const healthy = ok orelse return; // A client disconnect says nothing about the route.
         if (healthy) {
             e.fails = 0;
-            e.latency_ms = if (e.latency_ms == 0) latency_ms else (e.latency_ms * 3 + latency_ms) / 4;
+            // Generation time is model-dependent, not transport latency.
+            if (e.latency_ms == 0) e.latency_ms = latency_ms;
         } else {
             e.fails += 1;
             if (e.fails >= max_fails) {
@@ -210,17 +263,35 @@ pub const Pool = struct {
             }
             if (status == 429 or status == 403 or status == 408 or status >= 502) {
                 e.preferred = false;
-                e.blocked_until_ms = self.now() + 60_000;
+                e.throttle_strikes = @min(e.throttle_strikes + 1, 5);
+                e.blocked_until_ms = self.now() + @min(@as(i64, 900_000), @as(i64, 60_000) << @intCast(e.throttle_strikes - 1));
             }
             return;
         }
     }
 
     /// Diagnostics: tracked entries and whether a refresh pass is running.
-    pub fn diag(self: *Pool) struct { tracked: usize, working: bool, lists_ms: i64, validated_ms: i64, last_error: []const u8 } {
+    pub fn diag(self: *Pool) struct { tracked: usize, working: bool, lists_ms: i64, validated_ms: i64, last_error: []const u8, ready: usize, busy: usize, blocked: usize, waiting: usize, candidates: usize } {
         self.mu.lock();
         defer self.mu.unlock();
         return .{
+            .ready = self.readyCount(),
+            .busy = blk: {
+                var n: usize = 0;
+                for (self.entries.items) |e| if (e.in_flight) {
+                    n += 1;
+                };
+                break :blk n;
+            },
+            .blocked = blk: {
+                var n: usize = 0;
+                for (self.entries.items) |e| if (e.blocked_until_ms > self.now()) {
+                    n += 1;
+                };
+                break :blk n;
+            },
+            .waiting = self.waiting,
+            .candidates = self.candidates.items.len,
             .tracked = self.entries.items.len,
             .working = self.working,
             .lists_ms = self.lists_fetched_ms,
@@ -249,11 +320,12 @@ pub const Pool = struct {
         if (self.stopping or self.working) return;
         const stale = self.now() - self.pool_validated_ms > validation_refresh_ms or
             self.now() - self.lists_fetched_ms > list_refresh_ms or
-            (self.entries.items.len < 3 and self.now() - self.pool_validated_ms > 10_000);
+            (self.readyCount() < 16 and self.now() - self.refresh_started_ms >= 5000);
         if (!stale) return;
         const ctx = self.alloc.create(RefreshCtx) catch return;
         ctx.* = .{ .pool = self };
         self.working = true;
+        self.refresh_started_ms = self.now();
         self.tasks.concurrent(self.io, refreshTask, .{ctx}) catch {
             self.working = false;
             self.alloc.destroy(ctx);
@@ -286,7 +358,9 @@ pub const Pool = struct {
             candidate: Candidate,
             fn run(job: @This()) void {
                 job.pool.mu.lock();
-                const blocked = job.pool.quarantined(job.candidate.host, job.candidate.port);
+                const blocked = job.pool.quarantined(job.candidate.host, job.candidate.port) or for (job.pool.entries.items) |entry| {
+                    if (entry.port == job.candidate.port and std.mem.eql(u8, entry.host, job.candidate.host) and (entry.in_flight or entry.blocked_until_ms > job.pool.now())) break true;
+                } else false;
                 job.pool.mu.unlock();
                 if (blocked) return;
                 const t0 = nowMs();
@@ -307,7 +381,22 @@ pub const Pool = struct {
                         return;
                     }
                 }
-                if (p.entries.items.len >= max_pool) return;
+                if (p.entries.items.len >= max_pool) {
+                    var replace: ?usize = null;
+                    for (p.entries.items, 0..) |entry, i| {
+                        if (entry.in_flight) continue;
+                        if (entry.blocked_until_ms > p.now() or p.now() - entry.validated_ms > 2 * validation_refresh_ms) {
+                            replace = i;
+                            break;
+                        }
+                    }
+                    const idx = replace orelse return;
+                    const old = p.entries.orderedRemove(idx);
+                    p.quarantineRoute(old.host, old.port);
+                    const q = &p.quarantine[(p.quarantine_next -% 1) % p.quarantine.len];
+                    q.until = @max(q.until, old.blocked_until_ms);
+                    p.alloc.free(old.host);
+                }
                 const host = p.alloc.dupe(u8, job.candidate.host) catch return;
                 p.entries.append(p.alloc, .{ .host = host, .port = job.candidate.port, .latency_ms = @intCast(@max(0, nowMs() - t0)), .validated_ms = nowMs() }) catch {
                     p.alloc.free(host);
@@ -316,7 +405,7 @@ pub const Pool = struct {
             }
         };
         var offset: usize = 0;
-        while (offset < fresh.items.len and offset < 600) : (offset += 24) {
+        while (offset < fresh.items.len) : (offset += 24) {
             try std.Io.checkCancel(pool.io);
             var group: std.Io.Group = .init;
             defer group.cancel(pool.io);
@@ -324,7 +413,10 @@ pub const Pool = struct {
                 group.concurrent(pool.io, Job.run, .{Job{ .pool = pool, .candidate = cand }}) catch break;
             }
             try group.await(pool.io);
-            if (pool.alive() >= 12) break;
+            pool.mu.lock();
+            const enough = pool.readyCount() >= 32;
+            pool.mu.unlock();
+            if (enough and offset + 24 >= max_pool) break;
         }
         pool.mu.lock();
         var stale_index: usize = 0;
@@ -347,66 +439,100 @@ pub const Pool = struct {
     };
     const CandidateList = std.ArrayList(Candidate);
 
-    /// Pull all list sources into one deduped candidate list.
+    /// Download sources concurrently, interleave them, and retain a reservoir.
+    /// Each refill advances through it instead of retrying the same first page.
     fn fetchLists(pool: *Pool, alloc: Allocator) !CandidateList {
         var out: CandidateList = .empty;
         errdefer {
-            for (out.items) |*c| alloc.free(c.host);
+            for (out.items) |c| alloc.free(c.host);
             out.deinit(alloc);
         }
-        var seen: std.StringHashMap(void) = std.StringHashMap(void).init(alloc);
+        pool.mu.lock();
+        const refresh_lists = pool.candidates.items.len == 0 or pool.now() - pool.lists_fetched_ms >= list_refresh_ms;
+        pool.mu.unlock();
+        if (refresh_lists) {
+            const Fetch = struct {
+                fn run(p: *Pool, url: []const u8, body: *?[]u8) void {
+                    body.* = timed([]u8, p.io, 6000, httpGet, .{ p, p.alloc, url }) catch null;
+                }
+            };
+            var bodies: [list_sources.len]?[]u8 = @splat(null);
+            defer for (bodies) |body| if (body) |bytes| alloc.free(bytes);
+            var group: std.Io.Group = .init;
+            defer group.cancel(pool.io);
+            for (list_sources, 0..) |src, i| try group.concurrent(pool.io, Fetch.run, .{ pool, src, &bodies[i] });
+            try group.await(pool.io);
+            var merged = try mergeSources(alloc, &bodies);
+            pool.mu.lock();
+            if (merged.items.len != 0) {
+                for (pool.candidates.items) |c| alloc.free(c.host);
+                pool.candidates.deinit(alloc);
+                pool.candidates = merged;
+                pool.candidate_cursor = 0;
+            } else merged.deinit(alloc);
+            pool.lists_fetched_ms = pool.now();
+            pool.mu.unlock();
+        }
+        pool.mu.lock();
+        defer pool.mu.unlock();
+        // Revalidate idle, eligible routes first, preserving their warm leases.
+        for (pool.entries.items) |e| {
+            if (e.in_flight or e.blocked_until_ms > pool.now() or pool.quarantined(e.host, e.port)) continue;
+            if (pool.now() - e.validated_ms < validation_refresh_ms) continue;
+            try out.append(alloc, .{ .host = try alloc.dupe(u8, e.host), .port = e.port });
+        }
+        const count = @min(pool.candidates.items.len, 192);
+        for (0..count) |_| {
+            const c = pool.candidates.items[pool.candidate_cursor % pool.candidates.items.len];
+            pool.candidate_cursor += 1;
+            if (pool.quarantined(c.host, c.port)) continue;
+            const exists = for (pool.entries.items) |e| {
+                if (e.port == c.port and std.mem.eql(u8, e.host, c.host)) break true;
+            } else false;
+            if (exists) continue;
+            try out.append(alloc, .{ .host = try alloc.dupe(u8, c.host), .port = c.port });
+        }
+        return out;
+    }
+
+    fn mergeSources(alloc: Allocator, bodies: []const ?[]const u8) !CandidateList {
+        var out: CandidateList = .empty;
+        errdefer {
+            for (out.items) |c| alloc.free(c.host);
+            out.deinit(alloc);
+        }
+        const positions = try alloc.alloc(usize, bodies.len);
+        defer alloc.free(positions);
+        @memset(positions, 0);
+        var seen: std.StringHashMap(void) = .init(alloc);
         defer {
-            var it = seen.keyIterator();
-            while (it.next()) |k| alloc.free(k.*);
+            var keys = seen.keyIterator();
+            while (keys.next()) |key| alloc.free(key.*);
             seen.deinit();
         }
-
-        pool.mu.lock();
-        for (pool.entries.items) |entry| {
-            if (entry.in_flight or pool.quarantined(entry.host, entry.port)) continue;
-            const copy = alloc.dupe(u8, entry.host) catch continue;
-            out.append(alloc, .{ .host = copy, .port = entry.port }) catch alloc.free(copy);
-        }
-        const refresh_lists = pool.now() - pool.lists_fetched_ms >= list_refresh_ms or out.items.len < 3;
-        pool.mu.unlock();
-        if (!refresh_lists) return out;
-
-        for (list_sources) |src| {
-            const body = timed([]u8, pool.io, 10000, httpGet, .{ pool, alloc, src }) catch continue;
-            defer alloc.free(body);
-            var it = std.mem.splitAny(u8, body, "\r\n");
-            while (it.next()) |line_raw| {
-                const line = std.mem.trim(u8, line_raw, " \t");
-                if (line.len == 0 or line[0] == '#') continue;
+        while (out.items.len < 6000) {
+            var more = false;
+            for (bodies, 0..) |body, i| {
+                const bytes = body orelse continue;
+                if (positions[i] >= bytes.len) continue;
+                more = true;
+                const start = positions[i];
+                const end = if (std.mem.indexOfScalarPos(u8, bytes, start, '\n')) |n| n else bytes.len;
+                positions[i] = end + 1;
+                var line = std.mem.trim(u8, bytes[start..end], " \t\r");
+                if (std.mem.startsWith(u8, line, "http://")) line = line[7..];
                 const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
                 const host = line[0..colon];
                 const port = std.fmt.parseInt(u16, line[colon + 1 ..], 10) catch continue;
                 if (port == 0) continue;
-                if (host.len < 7 or host.len > 15) continue; // ipv4 only
-                var valid = true;
-                for (host) |c| {
-                    if ((c < '0' or c > '9') and c != '.') {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (!valid) continue;
-                const key = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
-                if (seen.contains(key)) {
-                    alloc.free(key);
-                    continue;
-                }
+                _ = std.Io.net.IpAddress.parseIp4(host, port) catch continue;
+                if (seen.contains(line)) continue;
+                const key = try alloc.dupe(u8, line);
                 try seen.put(key, {});
-                try out.append(alloc, .{
-                    .host = try alloc.dupe(u8, host),
-                    .port = port,
-                });
+                try out.append(alloc, .{ .host = try alloc.dupe(u8, host), .port = port });
             }
-            if (out.items.len > 600) break; // plenty of candidates
+            if (!more) break;
         }
-        pool.mu.lock();
-        pool.lists_fetched_ms = pool.now();
-        pool.mu.unlock();
         return out;
     }
 };
@@ -514,6 +640,7 @@ test "pool feedback follows endpoint identity after removals and cools only egre
     const a = std.testing.allocator;
     var pool = Pool.init(a, std.testing.io);
     defer pool.deinit();
+    pool.stopping = true; // Deterministic fixtures must never fetch public lists.
     pool.lists_fetched_ms = nowMs();
     pool.pool_validated_ms = nowMs();
     try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 1001 });
@@ -584,4 +711,114 @@ test "background failures cannot evict a route with an active request" {
     pool.report(.{ .host = route.host, .port = route.port, .index = 0 }, 0, false);
     try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
     pool.report(route, 1, true);
+}
+
+test "fast successful routes are reused and model generation time is not probe latency" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 1, .latency_ms = 900, .last_used = 0 });
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 2, .latency_ms = 100, .last_used = 20 });
+    const fast = pool.pick(a).?;
+    defer a.free(fast.host);
+    try std.testing.expectEqual(@as(u16, 2), fast.port);
+    pool.report(fast, 30_000, true);
+    try std.testing.expectEqual(@as(u32, 100), pool.entries.items[1].latency_ms);
+    const again = pool.pick(a).?;
+    defer a.free(again.host);
+    try std.testing.expectEqual(fast.port, again.port);
+    pool.report(again, 0, null);
+}
+
+test "blocked and busy routes do not count as refill capacity and catalog success cannot undo cooldown" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 3 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    try std.testing.expectEqual(@as(usize, 0), pool.readyCount());
+    pool.routeStatus(route, 403);
+    pool.report(route, 10, true);
+    const first = pool.entries.items[0].blocked_until_ms;
+    try std.testing.expectEqual(@as(usize, 0), pool.readyCount());
+    pool.routeStatus(route, 200);
+    try std.testing.expect(pool.pick(a) == null);
+    pool.routeStatus(route, 429);
+    try std.testing.expect(pool.entries.items[0].blocked_until_ms > first);
+}
+
+test "sources interleave, deduplicate and reject malformed addresses" {
+    const a = std.testing.allocator;
+    const sources = [_]?[]const u8{ "1.1.1.1:80\n2.2.2.2:80\n999.1.1.1:80", "http://3.3.3.3:8080\n1.1.1.1:80\ninvalid:99", null };
+    var merged = try Pool.mergeSources(a, &sources);
+    defer {
+        for (merged.items) |c| a.free(c.host);
+        merged.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 3), merged.items.len);
+    try std.testing.expectEqualStrings("3.3.3.3", merged.items[1].host);
+}
+
+test "refills advance through cached candidates without fetching lists" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    pool.lists_fetched_ms = nowMs();
+    for (0..300) |i| try pool.candidates.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = @intCast(i + 1) });
+    var first = try Pool.fetchLists(&pool, a);
+    defer {
+        for (first.items) |c| a.free(c.host);
+        first.deinit(a);
+    }
+    var next = try Pool.fetchLists(&pool, a);
+    defer {
+        for (next.items) |c| a.free(c.host);
+        next.deinit(a);
+    }
+    try std.testing.expectEqual(@as(u16, 1), first.items[0].port);
+    try std.testing.expectEqual(@as(u16, 193), next.items[0].port);
+}
+
+test "queued request acquires released lease without concurrent reuse" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 9 });
+    const held = pool.pick(a).?;
+    defer a.free(held.host);
+    const Release = struct {
+        fn run(p: *Pool, r: Picked) void {
+            std.Io.sleep(p.io, .fromMilliseconds(50), .awake) catch return;
+            p.report(r, 10, true);
+        }
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(pool.io);
+    try group.concurrent(pool.io, Release.run, .{ &pool, held });
+    const acquired = (try pool.waitForRoute(a, &.{}, 500)).?;
+    defer a.free(acquired.host);
+    try std.testing.expectEqual(held.port, acquired.port);
+    pool.report(acquired, 0, null);
+    try group.await(pool.io);
+    try std.testing.expectEqual(@as(usize, 0), pool.waiting);
+}
+
+test "queue timeout releases admission without losing an active route" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 10 });
+    const held = pool.pick(a).?;
+    defer a.free(held.host);
+    try std.testing.expect((try pool.waitForRoute(a, &.{}, 50)) == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.waiting);
+    try std.testing.expect(pool.entries.items[0].in_flight);
+    pool.report(held, 0, null);
+    try std.testing.expectEqual(@as(usize, 1), pool.readyCount());
 }

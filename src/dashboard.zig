@@ -813,12 +813,14 @@ fn handleStatus(c: *Controller, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
     const served = c.proxy.totalServedCount();
     var proxies_alive: usize = 0;
     var pool_diag_tracked: usize = 0;
+    var pool_capacity: [5]usize = @splat(0);
     var pool_diag_working = false;
     var pool_diag_error: []const u8 = "";
     if (c.free_proxies) |pool| {
         proxies_alive = pool.alive();
         const dg = pool.diag();
         pool_diag_tracked = dg.tracked;
+        pool_capacity = .{ dg.ready, dg.busy, dg.blocked, dg.waiting, dg.candidates };
         pool_diag_working = dg.working;
         pool_diag_error = dg.last_error;
     }
@@ -827,7 +829,7 @@ fn handleStatus(c: *Controller, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
         alloc,
         "{{\"running\":{s},\"port\":{d},\"bound_port\":{d},\"pool_tracked\":{d},\"pool_working\":{s},\"in_flight\":{d}," ++
             "\"total_served\":{d},\"providers\":{d},\"total_keys\":{d},\"healthy_keys\":{d}," ++
-            "\"avg_latency_ms\":{d},\"total_errors\":{d},\"total_failovers\":{d},\"proxies_alive\":{d}}}",
+            "\"avg_latency_ms\":{d},\"total_errors\":{d},\"total_failovers\":{d},\"proxies_alive\":{d},\"pool_ready\":{d},\"pool_busy\":{d},\"pool_blocked\":{d},\"pool_waiting\":{d},\"pool_candidates\":{d}}}",
         .{
             if (running) "true" else "false",
             port,
@@ -843,6 +845,11 @@ fn handleStatus(c: *Controller, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
             snap.total_errors,
             snap.total_failovers,
             proxies_alive,
+            pool_capacity[0],
+            pool_capacity[1],
+            pool_capacity[2],
+            pool_capacity[3],
+            pool_capacity[4],
         },
     ) catch return sendError(writer, 500, "out of memory");
     sendJson(writer, 200, body) catch {};

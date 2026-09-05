@@ -36,6 +36,7 @@ class Hop:
    req=head(c)
    length=int(next(x for x in req.split(b'\r\n') if x.lower().startswith(b'content-length:')).split(b':')[1]);body=req.split(b'\r\n\r\n',1)[1]
    while len(body)<length:body+=c.recv(min(65536,length-len(body)))
+   if self.mode=='slow-ok':time.sleep(.12)
    if self.mode=='reset':return
    if self.mode=='head-stall':self.stop.wait(5);return
    if self.mode=='body-stall':
@@ -92,25 +93,26 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
  finally:
   if proc.poll() is None:proc.kill();proc.wait()
   for h in hops:h.close()
-for broken in ['reset','truncated','head-stall','body-stall']:
- raw,elapsed,seen,state=run([broken,'ok']);assert raw.startswith(b'HTTP/1.1 200'),raw[:400];assert seen==[1,1],seen;assert elapsed<3,(broken,elapsed)
- print('PASS',broken,'fails over once to a healthy route; key unchanged')
-for stalled in ['connect-stall','upload-stall','body-stall']:
- raw,elapsed,seen,state=run([stalled],large=stalled=='upload-stall');assert not raw.startswith(b'HTTP/1.1 200'),raw[:300];assert elapsed<3.5,(stalled,elapsed);assert state['remaining_routes']==0,state
- print('PASS',stalled,'bounded by shared deadline; incomplete 200 quarantined')
-raw,elapsed,seen,state=run(['stream-cut','ok'],stream=True);assert seen==[1,0],seen;assert b'partial' in raw and raw.count(b'HTTP/1.1')==1
-print('PASS interrupted stream closes without replay or a second HTTP response')
+if __name__=='__main__':
+ for broken in ['reset','truncated','head-stall','body-stall']:
+  raw,elapsed,seen,state=run([broken,'ok']);assert raw.startswith(b'HTTP/1.1 200'),raw[:400];assert seen==[1,1],seen;assert elapsed<3,(broken,elapsed)
+  print('PASS',broken,'fails over once to a healthy route; key unchanged')
+ for stalled in ['connect-stall','upload-stall','body-stall']:
+  raw,elapsed,seen,state=run([stalled],large=stalled=='upload-stall');assert not raw.startswith(b'HTTP/1.1 200'),raw[:300];assert elapsed<3.5,(stalled,elapsed);assert state['remaining_routes']==0,state
+  print('PASS',stalled,'bounded by shared deadline; incomplete 200 quarantined')
+ raw,elapsed,seen,state=run(['stream-cut','ok'],stream=True);assert seen==[1,0],seen;assert b'partial' in raw and raw.count(b'HTTP/1.1')==1
+ print('PASS interrupted stream closes without replay or a second HTTP response')
 
-raw,elapsed,seen,state=run(['stream-idle','ok'],stream=True)
-assert seen==[1,0] and elapsed<3.5 and state['remaining_routes']==1,(seen,elapsed,state)
-print('PASS streaming idle timeout quarantines the route without replay')
-raw,elapsed,seen,state=run(['client-close','ok'],stream=True,disconnect=True)
-assert seen==[1,0] and state['remaining_routes']==2,(seen,state)
-print('PASS downstream disconnect is not retried and does not penalize the public proxy or API key')
+ raw,elapsed,seen,state=run(['stream-idle','ok'],stream=True)
+ assert seen==[1,0] and elapsed<3.5 and state['remaining_routes']==1,(seen,elapsed,state)
+ print('PASS streaming idle timeout quarantines the route without replay')
+ raw,elapsed,seen,state=run(['client-close','ok'],stream=True,disconnect=True)
+ assert seen==[1,0] and state['remaining_routes']==2,(seen,state)
+ print('PASS downstream disconnect is not retried and does not penalize the public proxy or API key')
 
-raw,elapsed,seen,state=run(['stream-clean-cut','ok'],stream=True)
-assert seen==[1,0] and state['remaining_routes']==1,(seen,state)
-print('PASS clean HTTP EOF without a completed SSE stream is not marked healthy')
-raw,elapsed,seen,state=run(['stream-ok','ok'],stream=True)
-assert seen==[1,0] and state['remaining_routes']==2 and raw.endswith(b'0\r\n\r\n'),(seen,state,raw[-100:])
-print('PASS complete SSE stream remains healthy')
+ raw,elapsed,seen,state=run(['stream-clean-cut','ok'],stream=True)
+ assert seen==[1,0] and state['remaining_routes']==1,(seen,state)
+ print('PASS clean HTTP EOF without a completed SSE stream is not marked healthy')
+ raw,elapsed,seen,state=run(['stream-ok','ok'],stream=True)
+ assert seen==[1,0] and state['remaining_routes']==2 and raw.endswith(b'0\r\n\r\n'),(seen,state,raw[-100:])
+ print('PASS complete SSE stream remains healthy')

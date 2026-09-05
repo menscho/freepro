@@ -607,6 +607,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Idle loop: the proxy owns its threads; here we only wait for quit/EOF.
     var last_usage_save = realtimeMillis();
+    var last_pool_tick = realtimeMillis();
     while (!g.shutdown.load(.acquire)) {
         if (updater.ready() and controller.inFlight() == 0) {
             stopProxy();
@@ -635,6 +636,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             config_mod.saveToPath(g.alloc, g.io, &g.config, g.config_path) catch {};
             controller.mu.unlock();
             last_usage_save = realtimeMillis();
+        }
+        if (realtimeMillis() - last_pool_tick >= 5000) {
+            controller.mu.lock();
+            const needs_pool = for (g.config.providers) |p| {
+                if (p.use_free_proxy) break true;
+            } else false;
+            controller.mu.unlock();
+            if (needs_pool) g.proxies.maybeRefresh();
+            last_pool_tick = realtimeMillis();
         }
         std.Io.sleep(g.io, poll_delay, .awake) catch {};
     }
