@@ -566,7 +566,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer instance_lock.unlock(g.io);
     g.rot = null;
     g.server = null;
-    g.proxies = freeproxy_mod.Pool.init(alloc, g.io);
+    // Find the first use_free_proxy provider to validate pool candidates
+    // against its real origin (and a real model it serves). Only proxies the
+    // origin does NOT rate-limit enter the pool, so burned datacenter egress
+    // IPs never reach requests.
+    g.proxies = blk: {
+        var pool = freeproxy_mod.Pool.init(alloc, g.io);
+        for (g.config.providers) |*p| {
+            if (p.use_free_proxy and p.base_url.len != 0) {
+                // Probe the origin's chat/completions with the first enabled
+                // model that looks like a real (non-prefixed) id.
+                var probe_model: []const u8 = "";
+                for (p.models) |*m| {
+                    if (m.enabled and m.id.len != 0) {
+                        probe_model = m.id;
+                        break;
+                    }
+                }
+                pool = freeproxy_mod.Pool.initForOrigin(alloc, g.io, p.base_url, probe_model);
+                break;
+            }
+        }
+        break :blk pool;
+    };
     g.proxies.log_msg = struct {
         fn sink(msg: []const u8) void {
             g.log.info("{s}", .{msg});

@@ -3,7 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const timed = @import("freeproxy.zig").timed;
 const A = std.mem.Allocator;
-pub const version = "0.1.14";
+pub const version = "0.1.15";
 const repository = "https://github.com/menscho/freepro/releases/download/";
 const latest_url = "https://api.github.com/repos/menscho/freepro/releases/latest";
 const Mutex = if (@hasDecl(std.Thread, "Mutex"))
@@ -261,9 +261,9 @@ pub fn applyUpdate(a: A, io: std.Io, target: []const u8, marker: []const u8) !vo
 }
 
 test "release versions exclude current older malformed and prereleases" {
-    try std.testing.expect(newer("v0.1.15"));
+    try std.testing.expect(newer("v0.1.16"));
     try std.testing.expect(newer("v1.0.0"));
-    for ([_][]const u8{ "v0.1.14", "v0.1.13", "v0.1.12", "v0.1.11", "v0.1.10", "v0.1.9", "v0.1.8", "v0.1.7", "v0.1.6", "v0.1.5", "v0.1.4", "v0.1.3", "v0.1.0", "v0.0.9", "nope", "v0.2.0-beta.1" }) |v| try std.testing.expect(!newer(v));
+    for ([_][]const u8{ "v0.1.15", "v0.1.14", "v0.1.13", "v0.1.12", "v0.1.11", "v0.1.10", "v0.1.9", "v0.1.8", "v0.1.7", "v0.1.6", "v0.1.5", "v0.1.4", "v0.1.3", "v0.1.0", "v0.0.9", "nope", "v0.2.0-beta.1" }) |v| try std.testing.expect(!newer(v));
 }
 test "checksums reject tampering and absent assets" {
     var hash: [32]u8 = undefined;
@@ -279,12 +279,12 @@ test "release selection requires exact repository assets and checksum manifest" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const name = try std.fmt.allocPrint(a, "freepro-v0.1.15-{s}", .{platform()});
-    const url = try std.fmt.allocPrint(a, "{s}v0.1.15/{s}", .{ repository, name });
-    const valid = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.15", .assets = .{ .{ .name = name, .browser_download_url = url }, .{ .name = "SHA256SUMS", .browser_download_url = repository ++ "v0.1.15/SHA256SUMS" } } }, .{});
+    const name = try std.fmt.allocPrint(a, "freepro-v0.1.16-{s}", .{platform()});
+    const url = try std.fmt.allocPrint(a, "{s}v0.1.16/{s}", .{ repository, name });
+    const valid = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.16", .assets = .{ .{ .name = name, .browser_download_url = url }, .{ .name = "SHA256SUMS", .browser_download_url = repository ++ "v0.1.16/SHA256SUMS" } } }, .{});
     try std.testing.expect((try selectRelease(a, valid)) != null);
-    const missing = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.15", .assets = .{.{ .name = name, .browser_download_url = url }} }, .{});
+    const missing = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.16", .assets = .{.{ .name = name, .browser_download_url = url }} }, .{});
     try std.testing.expect((try selectRelease(a, missing)) == null);
-    const foreign = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.15", .assets = .{ .{ .name = name, .browser_download_url = "https://example.com/foreign" }, .{ .name = "SHA256SUMS", .browser_download_url = repository ++ "v0.1.15/SHA256SUMS" } } }, .{});
+    const foreign = try std.json.Stringify.valueAlloc(a, .{ .tag_name = "v0.1.16", .assets = .{ .{ .name = name, .browser_download_url = "https://example.com/foreign" }, .{ .name = "SHA256SUMS", .browser_download_url = repository ++ "v0.1.16/SHA256SUMS" } } }, .{});
     try std.testing.expect((try selectRelease(a, foreign)) == null);
 }

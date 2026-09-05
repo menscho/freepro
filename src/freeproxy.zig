@@ -173,6 +173,17 @@ pub const Pool = struct {
     last_refresh_error: []const u8 = "",
     /// Optional message sink (already-formatted string). Stringify at the call site.
     log_msg: ?*const fn ([]const u8) void = null,
+    /// When set, candidates are validated against THIS origin's chat endpoint
+    /// (a minimal completion POST) instead of only the neutral target. A
+    /// proxy the origin rate-limits (429/403) is rejected at validation time
+    /// instead of entering the pool and failing every request. This is what
+    /// makes public-proxy routing actually work against origins like OpenCode
+    /// Zen that reject burned datacenter egress IPs. The base URL points at
+    /// the origin's OpenAI root (e.g. https://opencode.ai/zen/v1/).
+    probe_origin: []const u8 = "",
+    /// Real model id used for the origin probe (see probe_origin). Must be a
+    /// model the origin actually serves, so its IP-based rate-limit fires.
+    probe_model: []const u8 = "mimo-v2.5-free",
     /// Sustained-demand hint: set by the request path when it has been waiting
     /// for capacity; lets the fetch kick in earlier than the next 5-min list
     /// cycle would. Cleared when a refresh pass starts.
@@ -274,6 +285,14 @@ pub const Pool = struct {
 
     pub fn init(alloc: Allocator, io: std.Io) Pool {
         return .{ .alloc = alloc, .io = io };
+    }
+
+    /// init with an origin to validate candidates against (see probe_origin).
+    pub fn initForOrigin(alloc: Allocator, io: std.Io, origin: []const u8, model: []const u8) Pool {
+        var p = Pool.init(alloc, io);
+        p.probe_origin = origin;
+        p.probe_model = model;
+        return p;
     }
 
     pub fn deinit(self: *Pool) void {
@@ -660,6 +679,18 @@ pub const Pool = struct {
                         job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
                         return;
                     };
+                    // Origin-aware re-check for idle routes too: a route the
+                    // origin has started rate-limiting is dropped.
+                    if (job.pool.probe_origin.len != 0) {
+                        const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
+                            job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
+                        }) catch false;
+                        if (!origin_ok) {
+                            job.pool.quarantineRoute(job.candidate.host, job.candidate.port, 10 * 60 * 1000);
+                            job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
+                            return;
+                        }
+                    }
                     job.pool.mu.lock();
                     for (job.pool.entries.items) |*e| {
                         if (e.port == job.candidate.port and std.mem.eql(u8, e.host, job.candidate.host)) {
@@ -683,6 +714,21 @@ pub const Pool = struct {
                 timed(void, job.pool.io, max_latency_ms, probeThrough, .{
                     job.pool, job.candidate.host, job.candidate.port,
                 }) catch return;
+                // Origin-aware check: if a real origin is configured, the
+                // candidate must NOT be rate-limited by it. A proxy the origin
+                // 429s/403s is burned for that provider and would fail every
+                // real request, so reject it here instead of pooling it.
+                if (job.pool.probe_origin.len != 0) {
+                    const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
+                        job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
+                    }) catch false;
+                    if (!origin_ok) {
+                        // Burned for this origin: quarantine the egress IP so
+                        // it is not retried for the whole list cycle.
+                        job.pool.quarantineRoute(job.candidate.host, job.candidate.port, 10 * 60 * 1000);
+                        return;
+                    }
+                }
                 const p = job.pool;
                 p.mu.lock();
                 defer p.mu.unlock();
@@ -971,6 +1017,52 @@ pub fn probeNeutralOk(io: std.Io, host: []const u8, port: u16) bool {
     return @intFromEnum(response.head.status) / 100 == 2;
 }
 
+/// Origin-aware probe: a minimal chat/completions POST through `host:port` to
+/// `origin` (the OpenAI-compatible root, e.g. https://opencode.ai/zen/v1/)
+/// for a REAL model id the origin serves. Returns true only when the origin
+/// does NOT rate-limit this proxy (status != 429/403). This is the probe that
+/// keeps proxies the origin has burned (datacenter IPs it 429s) OUT of the
+/// pool: an unknown model returns the same error for good and burned proxies
+/// alike, so the probe MUST use a real model to trigger the origin's IP-based
+/// rate-limit.
+pub fn probeOriginOk(io: std.Io, origin: []const u8, model: []const u8, host: []const u8, port: u16) bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const proxy = arena.create(HttpClient.Proxy) catch return false;
+    proxy.* = .{
+        .protocol = .plain,
+        .host = std.Io.net.HostName.init(arena.dupe(u8, host) catch return false) catch return false,
+        .port = port,
+        .authorization = null,
+        .supports_connect = true,
+    };
+    const origin_trim = std.mem.trimEnd(u8, origin, "/");
+    const uri = std.Uri.parse(origin_trim) catch return false;
+    var client: HttpClient = .{ .allocator = arena, .io = io };
+    defer client.deinit();
+    client.http_proxy = proxy;
+    client.https_proxy = proxy;
+    const body = std.fmt.allocPrint(arena, "{{\"model\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":1}}", .{model}) catch return false;
+    var req = client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .{ .override = "identity" },
+            .user_agent = .{ .override = "opencode/1.18.29" },
+        },
+    }) catch return false;
+    defer req.deinit();
+    req.sendBodyComplete(body) catch return false;
+    var redirect_buf: [512]u8 = undefined;
+    const response = req.receiveHead(&redirect_buf) catch return false;
+    const status = @intFromEnum(response.head.status);
+    // 2xx = accepted (proxy works for this origin). 4xx other than 429/403
+    // (unknown model, auth wall, etc.) still means the proxy reached the
+    // origin and was answered normally -> the proxy itself is fine. Only
+    // 429/403 (this egress rate-limited/burned by the origin) reject it.
+    return status != 429 and status != 403;
+}
 fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     var arena_state = std.heap.ArenaAllocator.init(pool.alloc);
     defer arena_state.deinit();
@@ -992,8 +1084,7 @@ fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     var req = try client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{ .accept_encoding = .{ .override = "identity" } },
-    });
-    defer req.deinit();
+    });    defer req.deinit();
     try req.sendBodiless();
     var redirect_buf: [512]u8 = undefined;
     const response = try req.receiveHead(&redirect_buf);
