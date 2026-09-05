@@ -17,7 +17,9 @@ def head(c):
  return data
 class Hop:
  def __init__(self,mode):
-  self.mode=mode;self.seen=0;self.stop=threading.Event();self.server=socket.socket();self.server.bind(('127.0.0.1',0));self.server.listen();self.server.settimeout(.1);self.port=self.server.getsockname()[1]
+  self.mode=mode;self.seen=0;self.stop=threading.Event();self.server=socket.socket()
+  if mode=='upload-stall':self.server.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096)
+  self.server.bind(('127.0.0.1',0));self.server.listen();self.server.settimeout(.1);self.port=self.server.getsockname()[1]
   threading.Thread(target=self.accept,daemon=True).start()
  def accept(self):
   while not self.stop.is_set():
@@ -68,7 +70,7 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
     with socket.create_connection(('127.0.0.1',port),timeout=.1):pass
     break
    except OSError:time.sleep(.03)
-  body=json.dumps({'model':'test/model','messages':[{'role':'user','content':'x'*(8_000_000 if large else 5)}],'stream':stream}).encode()
+  body=json.dumps({'model':'test/model','messages':[{'role':'user','content':'x'*(512_000 if large else 5)}],'stream':stream}).encode()
   request=b'POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body
   t=time.monotonic()
   with socket.create_connection(('127.0.0.1',port),timeout=5) as c:

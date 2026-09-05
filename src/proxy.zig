@@ -2688,11 +2688,8 @@ const FakeUpstream = struct {
     saw_model_len: usize,
     mu: Mutex,
 
-    fn run(self: *FakeUpstream) void {
+    fn run(self: *FakeUpstream, server: *Net.Server) void {
         const io = sharedIo();
-        const addr = Net.IpAddress.parseIp4(loopback_ip, self.port) catch return;
-        var server = addr.listen(io, .{ .reuse_address = true }) catch return;
-        defer server.deinit(io);
         while (self.requests.load(.seq_cst) < 64 and !self.stopping.load(.seq_cst)) {
             const conn = server.accept(io) catch return;
             self.serve(conn, io) catch {};
@@ -2867,9 +2864,12 @@ test "failover: 429 rotates bearer key and strips prefix" {
         .mu = .{},
     };
     // The stub blocks in socket IO, so it runs as a pool task (same APC
-    // rule as the proxy workers). It exits after 2 requests; the defer
+    // rule as the proxy workers). Bind before issuing requests; the defer
     // below guarantees teardown even on assertion failure.
-    var fake_future = std.Io.async(sharedIo(), FakeUpstream.run, .{&fake});
+    const fake_addr = try Net.IpAddress.parseIp4(loopback_ip, fake.port);
+    var fake_server = try fake_addr.listen(sharedIo(), .{ .reuse_address = true });
+    defer fake_server.deinit(sharedIo());
+    var fake_future = std.Io.async(sharedIo(), FakeUpstream.run, .{ &fake, &fake_server });
     defer {
         fake.stopping.store(true, .seq_cst);
         pokePortOnPool(fake.port); // wake a blocking accept() so run() can exit
@@ -2947,7 +2947,10 @@ test "usage capture: tokens recorded from upstream response" {
         .saw_model_len = 0,
         .mu = .{},
     };
-    var fake_future = std.Io.async(sharedIo(), FakeUpstream.run, .{&fake});
+    const fake_addr = try Net.IpAddress.parseIp4(loopback_ip, fake.port);
+    var fake_server = try fake_addr.listen(sharedIo(), .{ .reuse_address = true });
+    defer fake_server.deinit(sharedIo());
+    var fake_future = std.Io.async(sharedIo(), FakeUpstream.run, .{ &fake, &fake_server });
     defer {
         fake.stopping.store(true, .seq_cst);
         pokePortOnPool(fake.port);
