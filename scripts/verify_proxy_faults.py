@@ -16,10 +16,10 @@ def head(c):
   data+=part
  return data
 class Hop:
- def __init__(self,mode):
+ def __init__(self,mode,host="127.0.0.1"):
   self.mode=mode;self.seen=0;self.stop=threading.Event();self.server=socket.socket()
   if mode=='upload-stall':self.server.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4096)
-  self.server.bind(('127.0.0.1',0));self.server.listen();self.server.settimeout(.1);self.port=self.server.getsockname()[1]
+  self.server.bind((host,0));self.server.listen();self.server.settimeout(.1);self.port=self.server.getsockname()[1]
   threading.Thread(target=self.accept,daemon=True).start()
  def accept(self):
   while not self.stop.is_set():
@@ -34,8 +34,17 @@ class Hop:
    c.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
    if self.mode=='upload-stall':self.stop.wait(5);return
    req=head(c)
+   if self.mode.startswith('catalog-'):
+    assert req.startswith(b'GET /v1/models HTTP/1.1'),req
+    code=404 if self.mode=='catalog-404' else 200
+    data=b'{"data":[]}' if self.mode!='catalog-html' else b'<html>blocked</html>'
+    length=len(data)+50 if self.mode=='catalog-truncated' else len(data)
+    c.sendall(f'HTTP/1.1 {code} Result\r\nContent-Length: {length}\r\n\r\n'.encode()+data);return
    length=int(next(x for x in req.split(b'\r\n') if x.lower().startswith(b'content-length:')).split(b':')[1]);body=req.split(b'\r\n\r\n',1)[1]
    while len(body)<length:body+=c.recv(min(65536,length-len(body)))
+   if self.mode=='throttle':
+    data=b'{"error":{"message":"rate limited"}}'
+    c.sendall(f'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n'.encode()+data);return
    if self.mode=='slow-ok':time.sleep(.12)
    if self.mode=='reset':return
    if self.mode=='head-stall':self.stop.wait(5);return
@@ -61,9 +70,9 @@ class Hop:
   finally:c.close()
  def close(self):self.stop.set();self.server.close()
 def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
- hops=[Hop(m) for m in modes]
+ hops=[Hop(m, f"127.0.0.{i+1}") for i,m in enumerate(modes)]
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
- env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_TIMEOUT=str(timeout))
+ env=dict(os.environ,TEST_PORT=str(port),TEST_ROUTES=','.join(str(h.port) for h in hops),TEST_HOSTS=','.join(f'127.0.0.{i+1}' for i in range(len(hops))),TEST_TIMEOUT=str(timeout))
  proc=subprocess.Popen([str(binary)],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  try:
   for _ in range(80):
@@ -94,6 +103,19 @@ def run(modes,timeout=1600,stream=False,large=False,disconnect=False):
   if proc.poll() is None:proc.kill();proc.wait()
   for h in hops:h.close()
 if __name__=='__main__':
+ for mode in ['catalog-ok','catalog-404','catalog-html','catalog-truncated']:
+  hop=Hop(mode)
+  try:
+   result=subprocess.run([str(binary)],env=dict(os.environ,TEST_CATALOG_PROXY_PORT=str(hop.port)),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5,check=True)
+   assert result.stdout==(b'true' if mode=='catalog-ok' else b'false'),(mode,result.stdout)
+   assert hop.seen==1
+  finally:hop.close()
+ print('PASS catalog probe uses GET /v1/models and rejects 404, HTML and incomplete 200 bodies')
+
+ raw,elapsed,seen,state=run(['throttle','ok'])
+ assert raw.startswith(b'HTTP/1.1 200') and seen==[1,1] and elapsed<1.5,(raw,elapsed,seen,state)
+ print('PASS 429 recovers without a synchronous neutral probe, within the shared deadline')
+
  for broken in ['reset','truncated','head-stall','body-stall']:
   raw,elapsed,seen,state=run([broken,'ok']);assert raw.startswith(b'HTTP/1.1 200'),raw[:400];assert seen==[1,1],seen;assert elapsed<3,(broken,elapsed)
   print('PASS',broken,'fails over once to a healthy route; key unchanged')

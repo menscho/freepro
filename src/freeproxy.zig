@@ -178,17 +178,10 @@ pub const Pool = struct {
     last_refresh_error: []const u8 = "",
     /// Optional message sink (already-formatted string). Stringify at the call site.
     log_msg: ?*const fn ([]const u8) void = null,
-    /// When set, candidates are validated against THIS origin's chat endpoint
-    /// (a minimal completion POST) instead of only the neutral target. A
-    /// proxy the origin rate-limits (429/403) is rejected at validation time
-    /// instead of entering the pool and failing every request. This is what
-    /// makes public-proxy routing actually work against origins like OpenCode
-    /// Zen that reject burned datacenter egress IPs. The base URL points at
-    /// the origin's OpenAI root (e.g. https://opencode.ai/zen/v1/).
+    /// Optional anonymous origin catalog check, in addition to neutral TLS.
+    /// This proves catalog reachability only. Real completions earn preference.
     probe_origin: []const u8 = "",
-    /// Real model id used for the origin probe (see probe_origin). Must be a
-    /// model the origin actually serves, so its IP-based rate-limit fires.
-    probe_model: []const u8 = "mimo-v2.5-free",
+    probe_model: []const u8 = "",
     /// Sustained-demand hint: set by the request path when it has been waiting
     /// for capacity; lets the fetch kick in earlier than the next 5-min list
     /// cycle would. Cleared when a refresh pass starts.
@@ -198,8 +191,8 @@ pub const Pool = struct {
     /// only ITS OWN proxied requests; other providers keep flowing.
     origin_breaker_until_ms: [8]i64 = @splat(0),
     origin_breaker_strikes: [8]u8 = @splat(0),
-    last_breaker_host: [8][15]u8 = @splat(@splat(0)),
-    last_breaker_host_len: [8]usize = @splat(0),
+    breaker_hosts: [8][origin_breaker_threshold][15]u8 = @splat(@splat(@splat(0))),
+    breaker_host_lengths: [8][origin_breaker_threshold]usize = @splat(@splat(0)),
     last_breaker_at_ms: [8]i64 = @splat(0),
 
     fn breakerSlot(prefix: []const u8) usize {
@@ -220,26 +213,17 @@ pub const Pool = struct {
         const s = breakerSlot(prefix);
         const at = self.now();
         if (at < self.origin_breaker_until_ms[s]) return true;
-        const first_seen = self.last_breaker_host_len[s] == 0;
-        const same_host = std.mem.eql(u8, self.last_breaker_host[s][0..self.last_breaker_host_len[s]], host);
-        const window_expired = at - self.last_breaker_at_ms[s] > origin_breaker_window_ms;
-        if (!first_seen and same_host and !window_expired) return false;
-        if (first_seen) {
-            self.last_breaker_at_ms[s] = at;
-            self.origin_breaker_strikes[s] = 0;
-            if (host.len <= 15) {
-                self.last_breaker_host_len[s] = host.len;
-                @memcpy(self.last_breaker_host[s][0..host.len], host);
-            }
-            return false;
+        if (host.len > 15) return false;
+        if (at - self.last_breaker_at_ms[s] > origin_breaker_window_ms) self.origin_breaker_strikes[s] = 0;
+        const count = self.origin_breaker_strikes[s];
+        for (0..count) |i| {
+            if (std.mem.eql(u8, self.breaker_hosts[s][i][0..self.breaker_host_lengths[s][i]], host)) return false;
         }
-        const strikes: u8 = if (window_expired) 1 else self.origin_breaker_strikes[s] + 1;
+        if (count == 0) self.last_breaker_at_ms[s] = at;
+        @memcpy(self.breaker_hosts[s][count][0..host.len], host);
+        self.breaker_host_lengths[s][count] = host.len;
+        const strikes = count + 1;
         self.origin_breaker_strikes[s] = strikes;
-        self.last_breaker_at_ms[s] = at;
-        if (host.len <= 15) {
-            self.last_breaker_host_len[s] = host.len;
-            @memcpy(self.last_breaker_host[s][0..host.len], host);
-        }
         if (strikes >= origin_breaker_threshold) {
             self.origin_breaker_until_ms[s] = at + origin_breaker_open_ms;
             self.origin_breaker_strikes[s] = 0;
@@ -283,8 +267,10 @@ pub const Pool = struct {
             if (item.port == port and std.mem.eql(u8, item.host, host)) break i;
         } else return 0;
         const e = &self.entries.items[idx];
-        const cool_ms: i64 = if (retry_after_ms != 0) @min(@as(i64, @intCast(retry_after_ms)), 60_000) else 8_000;
-        e.blocked_until_ms = @max(e.blocked_until_ms, self.now() + cool_ms);
+        const cool_ms: i64 = if (retry_after_ms != 0) @intCast(@min(retry_after_ms, std.math.maxInt(i64))) else 60_000;
+        for (self.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.host, e.host)) entry.blocked_until_ms = @max(entry.blocked_until_ms, self.now() +| cool_ms);
+        }
         return cool_ms;
     }
 
@@ -495,6 +481,8 @@ pub const Pool = struct {
             e.uses +|= 1;
             if (e.latency_ms == 0) e.latency_ms = latency_ms;
         } else {
+            e.preferred = false;
+            e.blocked_until_ms = @max(e.blocked_until_ms, self.now() + 20_000);
             e.fails += 1;
             if (e.fails >= max_fails) {
                 const host = self.entries.items[index].host;
@@ -512,21 +500,19 @@ pub const Pool = struct {
     /// Crucially, the origin rate-limits by EGRESS IP, so a 429 through one
     /// proxy means every proxy behind the same IP is burned too. We cool ALL
     /// entries sharing that IP for a longer window, so the picker moves on to
-    /// egress IPs the origin actually accepts. A 2xx unblocks the IP again.
+    /// egress IPs the origin actually accepts. Success preserves newer cooldowns.
     pub fn routeStatus(self: *Pool, picked: Picked, status: u16) void {
         self.mu.lock();
         defer self.mu.unlock();
         const at = self.now();
         if (status >= 200 and status < 300) {
-            // The origin accepted this egress IP: unblock every entry behind
-            // it and mark them preferred, so working IPs are reused.
+            // Prefer the route that completed successfully, preserving cooldowns.
             for (self.entries.items) |*e2| {
                 if (e2.port == picked.port and std.mem.eql(u8, e2.host, picked.host)) {
                     e2.preferred = true;
                     e2.validated_ms = at;
-                    e2.blocked_until_ms = 0;
-                } else if (std.mem.eql(u8, e2.host, picked.host)) {
-                    e2.blocked_until_ms = 0;
+                    // A concurrent failure may have set a newer cooldown.
+                    // Let it expire naturally rather than clearing it here.
                 }
             }
             return;
@@ -694,18 +680,8 @@ pub const Pool = struct {
                         if (job.target_up) job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
                         return;
                     };
-                    // Origin-aware re-check for idle routes too: a route the
-                    // origin has started rate-limiting is dropped.
-                    if (job.pool.probe_origin.len != 0) {
-                        const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
-                            job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
-                        }) catch false;
-                        if (!origin_ok and job.target_up) {
-                            job.pool.quarantineRoute(job.candidate.host, job.candidate.port, 10 * 60 * 1000);
-                            job.pool.reportProbeFailure(job.candidate.host, job.candidate.port);
-                            return;
-                        }
-                    }
+                    // Neutral revalidation must not generate extra model traffic or
+                    // turn an origin throttle into a transport-health penalty.
                     job.pool.mu.lock();
                     for (job.pool.entries.items) |*e| {
                         if (e.port == job.candidate.port and std.mem.eql(u8, e.host, job.candidate.host)) {
@@ -729,10 +705,8 @@ pub const Pool = struct {
                 timed(void, job.pool.io, max_latency_ms, probeThrough, .{
                     job.pool, job.candidate.host, job.candidate.port,
                 }) catch return;
-                // Origin-aware check: if a real origin is configured, the
-                // candidate must NOT be rate-limited by it. A proxy the origin
-                // 429s/403s is burned for that provider and would fail every
-                // real request, so reject it here instead of pooling it.
+                // An anonymous catalog check is an additional reachability signal.
+                // It cannot guarantee that a generation will be accepted.
                 if (job.pool.probe_origin.len != 0) {
                     const origin_ok = timed(bool, job.pool.io, max_latency_ms, probeOriginOk, .{
                         job.pool.io, job.pool.probe_origin, job.pool.probe_model, job.candidate.host, job.candidate.port,
@@ -740,7 +714,9 @@ pub const Pool = struct {
                     if (!origin_ok) {
                         // Burned for this origin: quarantine the egress IP so
                         // it is not retried for the whole list cycle.
+                        job.pool.mu.lock();
                         job.pool.quarantineRoute(job.candidate.host, job.candidate.port, 10 * 60 * 1000);
+                        job.pool.mu.unlock();
                         return;
                     }
                 }
@@ -1058,14 +1034,8 @@ pub fn neutralTargetUp(io: std.Io) bool {
     return @intFromEnum(response.head.status) / 100 == 2;
 }
 
-/// Origin-aware probe: a minimal chat/completions POST through `host:port` to
-/// `origin` (the OpenAI-compatible root, e.g. https://opencode.ai/zen/v1/)
-/// for a REAL model id the origin serves. Returns true only when the origin
-/// does NOT rate-limit this proxy (status != 429/403). This is the probe that
-/// keeps proxies the origin has burned (datacenter IPs it 429s) OUT of the
-/// pool: an unknown model returns the same error for good and burned proxies
-/// alike, so the probe MUST use a real model to trigger the origin's IP-based
-/// rate-limit.
+/// Lightweight anonymous catalog check. Never generate model traffic during
+/// validation, and never mistake a 4xx/5xx response for a passing probe.
 pub fn probeOriginOk(io: std.Io, origin: []const u8, model: []const u8, host: []const u8, port: u16) bool {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1078,14 +1048,14 @@ pub fn probeOriginOk(io: std.Io, origin: []const u8, model: []const u8, host: []
         .authorization = null,
         .supports_connect = true,
     };
-    const origin_trim = std.mem.trimEnd(u8, origin, "/");
-    const uri = std.Uri.parse(origin_trim) catch return false;
+    _ = model;
+    const url = std.fmt.allocPrint(arena, "{s}/models", .{std.mem.trimEnd(u8, origin, "/")}) catch return false;
+    const uri = std.Uri.parse(url) catch return false;
     var client: HttpClient = .{ .allocator = arena, .io = io };
     defer client.deinit();
     client.http_proxy = proxy;
     client.https_proxy = proxy;
-    const body = std.fmt.allocPrint(arena, "{{\"model\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":1}}", .{model}) catch return false;
-    var req = client.request(.POST, uri, .{
+    var req = client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{
             .content_type = .{ .override = "application/json" },
@@ -1094,16 +1064,25 @@ pub fn probeOriginOk(io: std.Io, origin: []const u8, model: []const u8, host: []
         },
     }) catch return false;
     defer req.deinit();
-    req.sendBodyComplete(body) catch return false;
+    req.sendBodiless() catch return false;
     var redirect_buf: [512]u8 = undefined;
-    const response = req.receiveHead(&redirect_buf) catch return false;
+    var response = req.receiveHead(&redirect_buf) catch return false;
     const status = @intFromEnum(response.head.status);
-    // 2xx = accepted (proxy works for this origin). 4xx other than 429/403
-    // (unknown model, auth wall, etc.) still means the proxy reached the
-    // origin and was answered normally -> the proxy itself is fine. Only
-    // 429/403 (this egress rate-limited/burned by the origin) reject it.
-    return status != 429 and status != 403;
+    // Catalog reachability is only a routing check, never proof that a model
+    // completion is available. Only real successful requests earn preference.
+    if (status < 200 or status >= 300) return false;
+    var transfer: [4096]u8 = undefined;
+    const expected_length = response.head.content_length;
+    const body = response.reader(&transfer).allocRemaining(arena, .limited(2 * 1024 * 1024)) catch return false;
+    if (expected_length) |length| {
+        if (body.len != length) return false;
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch return false;
+    if (parsed.value != .object) return false;
+    const data = parsed.value.object.get("data") orelse return false;
+    return data == .array;
 }
+
 fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     var arena_state = std.heap.ArenaAllocator.init(pool.alloc);
     defer arena_state.deinit();
@@ -1125,7 +1104,8 @@ fn probeThrough(pool: *Pool, host: []const u8, port: u16) !void {
     var req = try client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{ .accept_encoding = .{ .override = "identity" } },
-    });    defer req.deinit();
+    });
+    defer req.deinit();
     try req.sendBodiless();
     var redirect_buf: [512]u8 = undefined;
     const response = try req.receiveHead(&redirect_buf);
@@ -1308,7 +1288,7 @@ test "routeStatus cools but never deletes; only repeated transport fails drop" {
     try std.testing.expectEqual(@as(usize, 0), pool.entries.items.len);
 }
 
-test "an origin 429 cools every proxy on the same egress IP, a 2xx unblocks them" {
+test "an origin 429 cools same-host routes and late success preserves cooldown" {
     const a = std.testing.allocator;
     var pool = Pool.init(a, std.testing.io);
     defer pool.deinit();
@@ -1331,10 +1311,10 @@ test "an origin 429 cools every proxy on the same egress IP, a 2xx unblocks them
     try std.testing.expectEqual(@as(usize, 2), blocked);
     // The clean-IP entry is not blocked and is pickable.
     try std.testing.expectEqual(@as(i64, 0), pool.entries.items[2].blocked_until_ms);
-    // A 2xx through the same IP unblocks both.
+    // A late 2xx must not erase a concurrent throttle.
     pool.routeStatus(.{ .host = "203.0.113.1", .port = 8001, .index = 0 }, 200);
     for (pool.entries.items) |e| {
-        if (std.mem.eql(u8, e.host, "203.0.113.1")) try std.testing.expectEqual(@as(i64, 0), e.blocked_until_ms);
+        if (std.mem.eql(u8, e.host, "203.0.113.1")) try std.testing.expect(e.blocked_until_ms > pool.now());
     }
 }
 
@@ -1369,7 +1349,7 @@ test "origin-throttle breaker trips per-provider on distinct egresses and opens"
     try std.testing.expect(!pool.originThrottleOpen("p1/"));
 
     try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.2"));
-    try std.testing.expect(!pool.noteOriginThrottle("p1/", "10.0.0.3"));
+    try std.testing.expect(pool.noteOriginThrottle("p1/", "10.0.0.3"));
     try std.testing.expect(pool.noteOriginThrottle("p1/", "10.0.0.4"));
     try std.testing.expect(pool.originThrottleOpen("p1/"));
 
@@ -1525,4 +1505,47 @@ test "new callers cannot bypass queued tickets when a route becomes free" {
     const route = pool.pick(a).?;
     defer a.free(route.host);
     pool.report(route, 0, null);
+}
+
+test "alternating the same two routes cannot trip a distinct-route breaker" {
+    var pool = Pool.init(std.testing.allocator, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    for (0..10) |_| {
+        try std.testing.expect(!pool.noteOriginThrottle("p/", "10.0.0.1"));
+        try std.testing.expect(!pool.noteOriginThrottle("p/", "10.0.0.2"));
+    }
+    try std.testing.expect(pool.noteOriginThrottle("p/", "10.0.0.3"));
+}
+
+test "late success cannot erase a newer host cooldown or retry-after" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8001 });
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8002 });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.routeStatus(route, 429);
+    const cool = pool.noteOriginThrottleRoute("p/", route.host, route.port, 120_000);
+    try std.testing.expectEqual(@as(i64, 120_000), cool);
+    pool.routeStatus(route, 200);
+    pool.report(route, 100, true);
+    for (pool.entries.items) |e| try std.testing.expect(e.blocked_until_ms >= pool.now() + 119_000);
+    try std.testing.expect(pool.pick(a) == null);
+}
+
+test "first transport failure demotes and cools a formerly preferred route" {
+    const a = std.testing.allocator;
+    var pool = Pool.init(a, std.testing.io);
+    defer pool.deinit();
+    pool.stopping = true;
+    try pool.entries.append(a, .{ .host = try a.dupe(u8, "127.0.0.1"), .port = 8001, .preferred = true });
+    const route = pool.pick(a).?;
+    defer a.free(route.host);
+    pool.report(route, 0, false);
+    try std.testing.expect(!pool.entries.items[0].preferred);
+    try std.testing.expect(pool.pick(a) == null);
+    try std.testing.expectEqual(@as(usize, 1), pool.entries.items.len);
 }

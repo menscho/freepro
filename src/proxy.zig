@@ -1287,7 +1287,7 @@ fn parseRetryAfter(head: anytype) u64 {
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) {
             const v = std.mem.trim(u8, h.value, " \t");
-            if (std.fmt.parseInt(u64, v, 10)) |secs| return secs * 1000 else |_| {}
+            if (std.fmt.parseInt(u64, v, 10)) |secs| return secs *| 1000 else |_| {}
             return 0;
         }
     }
@@ -1725,13 +1725,9 @@ fn forwardAttempt(
             if (pool.originThrottleOpen(prov.prefix)) return error.OriginThrottled;
             pool.noteDemand();
             ctx.phase = "waiting for public proxy";
-            // Cap a single wait short (3s): a proxy wait must not hold a
-            // worker hostage for the full request deadline. When the pool is
-            // empty, many concurrent requests would otherwise occupy every
-            // worker for up to 30s and backpressure the accept loop, stalling
-            // ALL traffic (including non-proxy and dashboard). Attempts retry
-            // within the shared deadline, so a short per-attempt wait is fine.
-            const wait_budget = try ctx.remaining(self.io, @min(3000, self.config.timeout_ms));
+            // Wait for busy healthy routes within bounded admission and the
+            // request deadline; a short fixed cap fails ordinary agent bursts.
+            const wait_budget = try ctx.remaining(self.io, @min(30_000, self.config.timeout_ms));
             picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, wait_budget);
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
         }
@@ -2069,33 +2065,18 @@ fn handleCompletions(
                     std.mem.indexOf(u8, outcome.body[0..@min(outcome.body.len, 256)], "<!DOCTYPE") != null);
             if (shouldFailoverStatus(outcome.status) or looks_html) {
                 if (outcome.status == 429 or outcome.status == 403) {
-                    // The origin throttled this egress. Distinguish "the
-                    // proxy is dead" from "the origin is rate-limiting": a
-                    // quick neutral probe of the SAME proxy tells us which.
+                    // The authenticated upstream response already proves connectivity.
+                    // Do not add a second network probe outside the request deadline.
                     const pool = self.free_proxies.?;
-                    const host = if (outcome.proxy_host.len != 0) outcome.proxy_host else ctx.routes.items[ctx.routes.items.len - 1].host;
-                    const port = if (outcome.proxy_port != 0) outcome.proxy_port else ctx.routes.items[ctx.routes.items.len - 1].port;
-                    // Short synchronous neutral probe of the same proxy.
-                    const probe_ok = freeproxy.timed(bool, self.io, 3000, freeproxy.probeNeutralOk, .{ self.io, host, port }) catch false;
-                    if (probe_ok) {
-                        // The proxy is fine; the ORIGIN is the cause. Cool
-                        // this route for this provider, honor Retry-After, and
-                        // (if several distinct egresses throttled) trip this
-                        // provider's breaker.
-                        const retry_ms = outcome.retry_after_ms;
-                        const cool_ms = pool.noteOriginThrottleRoute(prov.prefix, host, port, retry_ms);
-                        if (pool.noteOriginThrottle(prov.prefix, host)) {
-                            if (self.metrics) |m| m.noteFailover();
-                            if (self.logger) |l| l.warn("public proxy route failed ({d}); origin throttling through many egresses — pausing this provider's proxied attempts", .{outcome.status});
-                            const wait_ms: u64 = if (retry_ms != 0) retry_ms else @intCast(@max(cool_ms, 1000));
-                            try sendStatusRetryAfter(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly", @max(1, wait_ms / 1000));
-                            return 429;
-                        }
-                    } else {
-                        // The proxy itself is dead/burned: score it down via
-                        // the transport-failure path so it drops.
-                        if (self.logger) |l| l.info("public proxy {s}:{d} returned {d} AND failed the neutral probe; treating as dead", .{ host, port, outcome.status });
-                        pool.reportProxyDead(host, port);
+                    const host = outcome.proxy_host;
+                    const port = outcome.proxy_port;
+                    const retry_ms = outcome.retry_after_ms;
+                    const cool_ms = pool.noteOriginThrottleRoute(prov.prefix, host, port, retry_ms);
+                    if (pool.noteOriginThrottle(prov.prefix, host)) {
+                        if (self.metrics) |m| m.noteFailover();
+                        const wait_ms: u64 = if (retry_ms != 0) retry_ms else @intCast(@max(cool_ms, 1000));
+                        try sendStatusRetryAfter(writer, 429, "upstream is rate-limiting through the public proxy pool; try again shortly", @max(1, wait_ms / 1000));
+                        return 429;
                     }
                 }
                 if (self.metrics) |m| m.noteFailover();
