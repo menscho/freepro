@@ -536,6 +536,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g.config_path = try config_mod.configFilePath(alloc, &env_map);
     errdefer alloc.free(g.config_path);
     g.config = try loadConfigOrDefaults(alloc, g.config_path);
+    errdefer g.config.deinit(alloc);
+    try config_mod.ensureParentDir(g.io, g.config_path);
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{g.config_path});
+    defer alloc.free(lock_path);
+    const instance_lock = try std.Io.Dir.cwd().createFile(g.io, lock_path, .{ .read = true, .truncate = false });
+    defer instance_lock.close(g.io);
+    if (!try instance_lock.tryLock(g.io, .exclusive)) {
+        print("freepro is already running for this configuration.\n", .{});
+        if (env_map.get("FREEPRO_NO_BROWSER") == null) {
+            var existing_url: [64]u8 = undefined;
+            openBrowser(dashboardUrl(&existing_url));
+        }
+        g.config.deinit(alloc);
+        alloc.free(g.config_path);
+        return;
+    }
+    defer instance_lock.unlock(g.io);
     g.rot = null;
     g.server = null;
     g.proxies = freeproxy_mod.Pool.init(alloc, g.io);
@@ -580,6 +597,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     g.log.info("freepro serve starting (config: {s})", .{g.config_path});
     initRotator();
     restoreUsageFromConfig();
+    // Serve mode starts unconditionally: this binary exists to serve, so
+    // auto_start is not consulted (unlike the headless operator console).
+    if (!startProxy()) {
+        g.log.warn("proxy failed to start; exiting without saving over another instance", .{});
+        stopProxy();
+        deinitRotator();
+        g.proxies.deinit();
+        return error.ProxyStartFailed;
+    } else {
+        var url_buf: [64]u8 = undefined;
+        const url = dashboardUrl(&url_buf);
+        g.log.info("dashboard at {s}", .{url});
+        if (env_map.get("FREEPRO_NO_BROWSER") == null) openBrowser(url);
+    }
+
     // Start warming the free-proxy pool immediately when any provider uses
     // it, so the first proxied request never races validation.
     for (g.config.providers) |*p| {
@@ -587,17 +619,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             g.proxies.maybeRefresh();
             break;
         }
-    }
-
-    // Serve mode starts unconditionally: this binary exists to serve, so
-    // auto_start is not consulted (unlike the headless operator console).
-    if (!startProxy()) {
-        g.log.warn("proxy failed to start; fix the port and restart", .{});
-    } else {
-        var url_buf: [64]u8 = undefined;
-        const url = dashboardUrl(&url_buf);
-        g.log.info("dashboard at {s}", .{url});
-        if (env_map.get("FREEPRO_NO_BROWSER") == null) openBrowser(url);
     }
 
     updater.startCheck();

@@ -1630,7 +1630,7 @@ fn forwardAttempt(
         if (prov.use_free_proxy) {
             pool.maybeRefresh();
             ctx.phase = "waiting for public proxy";
-            picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 8000));
+            picked_proxy = try pool.waitForRoute(alloc, ctx.routes.items, try ctx.remaining(self.io, 30000));
             if (picked_proxy == null) return ProxyError.FreeProxyUnavailable;
         }
     }

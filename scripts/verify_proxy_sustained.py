@@ -31,7 +31,7 @@ def get(port,path='/fixture/state'):
 
 def chat(port):
  body=json.dumps({'model':'test/model','messages':[{'role':'user','content':'OK'}]}).encode()
- with urlopen(Request(f'http://127.0.0.1:{port}/v1/chat/completions',data=body,headers={'Content-Type':'application/json'}),timeout=12) as r:
+ with urlopen(Request(f'http://127.0.0.1:{port}/v1/chat/completions',data=body,headers={'Content-Type':'application/json'}),timeout=40) as r:
   assert r.status==200 and json.load(r)['choices'][0]['message']['content']=='OK'
 
 proc,hops,port=start(['client-stall','ok'],1000)
@@ -60,7 +60,7 @@ finally:
  for client in clients:client.close()
  stop(proc,hops)
 
-proc,hops,port=start(['slow-ok','slow-ok'],10000)
+proc,hops,port=start(['slow-ok','slow-ok'],40000)
 try:
  start_time=time.monotonic()
  for wave in range(6):
