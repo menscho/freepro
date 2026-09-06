@@ -96,6 +96,17 @@ pub fn siteUrlForPrefix(prefix: []const u8) []const u8 {
 /// not document them (plan.md free-tier dashboard contract).
 // Operator-selected defaults; per-model edits remain supported.
 pub const default_reasoning_levels = "low,medium,high,xhigh,max";
+
+/// Stack committed for every thread freepro creates, including the I/O pool
+/// workers that carry connections.
+///
+/// Zig's default (`std.Thread.SpawnConfig.default_stack_size`) is 16 MiB on
+/// Windows, and `std.Io.Threaded` adds a thread to its pool under load and
+/// never removes it — so a burst of concurrent requests used to leave hundreds
+/// of 16 MiB stacks committed for the life of the process (the 3 GB a long
+/// 100-agent run produced was exactly that). The largest stack buffers on these
+/// threads are 32 KiB, so 2 MiB leaves a wide margin at 1/8 the cost.
+pub const thread_stack_size: usize = 2 * 1024 * 1024;
 pub fn isLegacyReasoningLevels(levels: []const u8) bool {
     return std.mem.eql(u8, levels, "max,xhigh,high,low,none") or
         std.mem.eql(u8, levels, "max,high,low,none");

@@ -136,6 +136,13 @@
           <div class="quick-add-actions"><button type="button" class="btn outline" id="kimi-add-update" disabled>Add/Update</button><span>Then run <code>/reload</code> in Kimi Code.</span></div>
           <p id="kimi-add-status" class="quick-add-status" role="status" aria-live="polite" hidden></p>
         </article>
+        <article class="quick-add-card">
+          <div class="quick-add-heading"><svg width="52" height="52" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M10 2.6 16.4 6.3v7.4L10 17.4 3.6 13.7V6.3z"/><path d="M10 6.4 13.2 8.2v3.6L10 13.6 6.8 11.8V8.2z"/></svg><div><h3>Codex CLI &amp; Codex Desktop</h3><p>Your enabled models, in the Codex model picker.</p></div></div>
+          <div class="quick-add-config"><span>CONFIGURATION</span><code id="codex-config-path">Loading config location…</code></div>
+          <p class="quick-add-note">Adds the freepro provider to Codex and publishes your models through its catalog. Your existing Codex providers, MCP servers and projects stay in place; the previous config is kept as <code>config.toml.freepro.bak</code>.</p>
+          <div class="quick-add-actions"><button type="button" class="btn outline" id="codex-add-update" disabled>Add/Update</button><span>Then start <code>codex</code> or reopen Codex Desktop.</span></div>
+          <p id="codex-add-status" class="quick-add-status" role="status" aria-live="polite" hidden></p>
+        </article>
       </section>
       <section id="view-settings" data-view="settings" aria-label="Settings" hidden>
         <div class="card settings-card">

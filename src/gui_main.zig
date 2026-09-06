@@ -505,7 +505,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // App-owned I/O pool: file, stdio, sleep, and child-spawn calls on every
     // thread go through this. Joined (stdin thread) before deinit: the stdin
     // join is deferred later, so it runs first.
-    var threaded = std.Io.Threaded.init(alloc, .{ .environ = init.environ });
+    var threaded = std.Io.Threaded.init(alloc, .{
+        .environ = init.environ,
+        .stack_size = models.thread_stack_size,
+    });
     defer threaded.deinit();
 
     g.log = logger_mod.Logger.init();
@@ -594,9 +597,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer alloc.free(quickadd_token);
     const kimi_config_path = try @import("quickadd.zig").configPath(alloc, &env_map);
     defer alloc.free(kimi_config_path);
+    const codex_config_path = try @import("codexadd.zig").configPath(alloc, &env_map);
+    defer alloc.free(codex_config_path);
+    const codex_catalog_path = try @import("codexadd.zig").catalogPath(alloc, &env_map);
+    defer alloc.free(codex_catalog_path);
     controller = .{
         .updater = &updater,
         .kimi_config_path = kimi_config_path,
+        .codex_config_path = codex_config_path,
+        .codex_catalog_path = codex_catalog_path,
         .quickadd_token = quickadd_token,
         .alloc = alloc,
         .io = g.io,
@@ -646,7 +655,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     updater.startCheck();
 
-    const stdin_thread = if (background) null else try std.Thread.spawn(.{}, stdinThreadMain, .{});
+    const stdin_thread = if (background) null else try std.Thread.spawn(
+        .{ .stack_size = models.thread_stack_size }, stdinThreadMain, .{});
     defer if (stdin_thread) |t| t.join();
 
     // Idle loop: the proxy owns its threads; here we only wait for quit/EOF.

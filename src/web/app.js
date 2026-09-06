@@ -315,6 +315,7 @@
       loadModels();
     } else if (name === "quick-adds") {
       loadQuickAdd();
+      loadCodexQuickAdd();
     } else if (name === "settings") {
       loadSettings();
     }
@@ -360,6 +361,51 @@
       kimiMessage((result.changed ? "Saved · " + result.added + " added, " + result.updated + " updated." : "Already up to date.") + " Run /reload in Kimi Code.", false);
     }).catch(function (err) { kimiMessage(err.message, true); }).finally(function () {
       kimiBusy = false;
+      button.disabled = false;
+      button.textContent = "Add/Update";
+    });
+  }
+
+  var codexToken = "";
+  var codexBusy = false;
+  function codexMessage(message, error) {
+    var node = byId("codex-add-status");
+    if (!node) return;
+    node.hidden = false;
+    node.textContent = message;
+    node.dataset.error = error ? "true" : "false";
+  }
+  function codexRequest(body) {
+    return fetch("/api/quick-adds/codex", body ? {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    } : {}).then(function (response) {
+      return response.json().then(function (data) {
+        if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : (data.error && data.error.message) || "Could not update Codex.");
+        return data;
+      });
+    });
+  }
+  function loadCodexQuickAdd() {
+    var button = byId("codex-add-update");
+    if (!button) return;
+    button.disabled = true;
+    codexRequest().then(function (data) {
+      codexToken = data.token;
+      setText("codex-config-path", data.path);
+      if (!codexBusy) button.disabled = false;
+    }).catch(function (err) { codexMessage(err.message, true); });
+  }
+  function applyCodexQuickAdd() {
+    if (codexBusy || !codexToken) return;
+    codexBusy = true;
+    var button = byId("codex-add-update");
+    button.disabled = true;
+    button.textContent = "Updating…";
+    codexMessage("Updating your Codex configuration…", false);
+    codexRequest({ token: codexToken }).then(function (result) {
+      codexMessage((result.changed ? "Saved · " + result.model_count + " model(s) published." : "Already up to date.") + " Start codex or reopen Codex Desktop.", false);
+    }).catch(function (err) { codexMessage(err.message, true); }).finally(function () {
+      codexBusy = false;
       button.disabled = false;
       button.textContent = "Add/Update";
     });
@@ -1668,6 +1714,8 @@
     initRouter();
     var kimiAdd = byId("kimi-add-update");
     if (kimiAdd) kimiAdd.addEventListener("click", applyQuickAdd);
+    var codexAdd = byId("codex-add-update");
+    if (codexAdd) codexAdd.addEventListener("click", applyCodexQuickAdd);
     var tgl = byId("proxy-toggle");
     if (tgl) tgl.addEventListener("click", toggleServer);
     var endpointCopy = byId("copy-endpoint");

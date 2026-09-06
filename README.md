@@ -56,7 +56,7 @@ Windows ships as a standalone `.exe`. Linux builds use static musl. macOS builds
 
 3. The dashboard opens at **http://127.0.0.1:54321** — or the next free port, if something already holds that one; the launch terminal and the dashboard header both show the port in use. In **Providers**, add the keys required by your providers.
 4. In **Model library**, enable the models you want to use.
-5. Set your coding tool's base URL to `http://127.0.0.1:54321/v1` and select a model ID from `/v1/models`.
+5. Set your coding tool's base URL to `http://127.0.0.1:54321/v1` and select a model ID from `/v1/models`. freepro serves `/v1/chat/completions`, `/v1/completions` and `/v1/responses` (for Codex).
 
 If your client requires an API key for the local endpoint, use a placeholder such as `freepro-local`. Upstream provider keys are configured in the dashboard. The local service binds to loopback and is intended for use on your own machine.
 
@@ -69,6 +69,20 @@ Open **Quick adds → Kimi Code → Add/Update**, then run **`/reload`** in Kimi
 freepro locates `~/.kimi-code/config.toml` automatically (`%USERPROFILE%\.kimi-code\config.toml` on Windows). It adds or updates the `freepro` provider and enabled models, preserving other providers, custom settings, and your selected model. The first existing configuration is backed up as `config.toml.freepro.bak`; subsequent identical updates leave the file untouched.
 
 ![One-click Kimi Code configuration](docs/images/quick-adds.png)
+
+### Codex CLI and Codex Desktop
+
+Open **Quick adds → Codex CLI & Codex Desktop → Add/Update**, then start `codex`
+or reopen Codex Desktop.
+
+Codex talks only OpenAI's Responses API (`POST /v1/responses`), which freepro
+serves by translating to and from Chat Completions, including streaming replies
+and tool calls. The quick-add writes a `freepro` provider into
+`$CODEX_HOME/config.toml` (`~/.codex/config.toml`) and publishes your enabled
+models as a Codex model catalog, so they appear in the model picker. Existing
+providers, MCP servers, projects and desktop settings are preserved, the previous
+configuration is backed up as `config.toml.freepro.bak`, and applying it twice
+changes nothing.
 
 ### Providers and models
 

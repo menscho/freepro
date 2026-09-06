@@ -61,7 +61,11 @@ pub const validation_workers: usize = 64;
 /// below, the next check triggers an immediate fetch (POOL_SIZE_MIN analog).
 pub const target_ready: usize = 128;
 pub const max_validate_batch: usize = 1500;
-pub const max_candidates: usize = 80_000;
+/// Candidate reservoir cap. Each entry holds a heap-duped host string, so this
+/// is the pool's dominant retained allocation; kept modest to bound memory
+/// (the checker walks it continuously and re-fetches, so a smaller cap costs
+/// almost nothing in coverage).
+pub const max_candidates: usize = 20_000;
 /// Origin-throttle circuit breaker: when the origin returns 429/403 through
 /// this many DISTINCT egresses within `origin_breaker_window_ms`, the pool
 /// stops handing out proxies for `origin_breaker_open_ms` so requests fail

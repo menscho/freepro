@@ -108,6 +108,9 @@ fn nowUnixMs() i64 {
 pub const Controller = struct {
     updater: ?*@import("updater.zig").Updater = null,
     kimi_config_path: []const u8 = "",
+    /// Codex CLI and Codex Desktop share one config home (`$CODEX_HOME`).
+    codex_config_path: []const u8 = "",
+    codex_catalog_path: []const u8 = "",
     quickadd_token: []const u8 = "",
     alloc: Allocator,
     io: std.Io,
@@ -446,6 +449,7 @@ fn route(
     }
     if (is_get and std.mem.eql(u8, clean, "/kimi-logo.png")) return sendStatic(writer, "image/png", @embedFile("web/kimi-logo.png"));
     if (std.mem.eql(u8, clean, "/api/quick-adds/kimi") and (is_get or is_post)) return handleKimiQuickAdd(c, is_post, body, alloc, writer);
+    if (std.mem.eql(u8, clean, "/api/quick-adds/codex") and (is_get or is_post)) return handleCodexQuickAdd(c, is_post, body, alloc, writer);
 
     if (is_get and std.mem.eql(u8, clean, "/")) {
         return sendStatic(writer, "text/html", index_html);
@@ -522,6 +526,45 @@ fn handleKimiQuickAdd(c: *Controller, post: bool, body: []const u8, alloc: Alloc
         return sendError(writer, 400, msg);
     };
     const payload = std.json.Stringify.valueAlloc(alloc, result, .{}) catch return sendError(writer, 500, "Out of memory");
+    sendJson(writer, 200, payload) catch {};
+    return 200;
+}
+
+fn handleCodexQuickAdd(c: *Controller, post: bool, body: []const u8, alloc: Allocator, writer: *std.Io.Writer) ?u16 {
+    const codexadd = @import("codexadd.zig");
+    if (c.codex_config_path.len == 0 or c.codex_catalog_path.len == 0 or c.quickadd_token.len == 0) {
+        return sendError(writer, 400, "Codex home directory is unavailable.");
+    }
+    c.mu.lock();
+    defer c.mu.unlock();
+    if (!post) {
+        const payload = std.json.Stringify.valueAlloc(alloc, .{
+            .path = c.codex_config_path,
+            .catalog = c.codex_catalog_path,
+            .token = c.quickadd_token,
+        }, .{}) catch return sendError(writer, 500, "Out of memory");
+        sendJson(writer, 200, payload) catch {};
+        return 200;
+    }
+    const parsed = std.json.parseFromSlice(struct { token: []const u8 }, alloc, body, .{}) catch
+        return sendError(writer, 400, "Reload this page and try again.");
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.token, c.quickadd_token)) {
+        return sendError(writer, 400, "Reload this page and try again.");
+    }
+    // Codex has to be pointed at the port that is actually serving.
+    var snapshot = c.config.*;
+    if (c.isRunning()) snapshot.port = c.proxy.boundPort();
+    const result = codexadd.apply(alloc, c.io, c.codex_config_path, c.codex_catalog_path, snapshot) catch |err| {
+        const msg = switch (err) {
+            error.NoEnabledModels => "Enable at least one model in the model library first.",
+            error.ConfigChanged => "Codex config changed during the update. Please try again.",
+            else => "Could not update Codex config. Check file permissions and available disk space.",
+        };
+        return sendError(writer, 400, msg);
+    };
+    const payload = std.json.Stringify.valueAlloc(alloc, result, .{}) catch
+        return sendError(writer, 500, "Out of memory");
     sendJson(writer, 200, payload) catch {};
     return 200;
 }

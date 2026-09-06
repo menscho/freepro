@@ -82,6 +82,7 @@ const models = @import("models.zig");
 const rotator_mod = @import("rotator.zig");
 const freeproxy = @import("freeproxy.zig");
 const responses_mod = @import("responses.zig");
+const codex = @import("codex.zig");
 
 const Allocator = std.mem.Allocator;
 // Transport: blocking Winsock on Windows (the 0.16 std.Io.net backend is
@@ -194,7 +195,9 @@ fn sharedPool() std.Io {
     pool_mu.lock();
     defer pool_mu.unlock();
     if (pool_instance == null) {
-        pool_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        pool_instance = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .stack_size = models.thread_stack_size,
+        });
     }
     return pool_instance.?.io();
 }
@@ -399,6 +402,14 @@ pub const Metrics = struct {
 pub const max_header_bytes: usize = 64 * 1024;
 /// Cap for an inbound client body (chat payloads are small; 16 MiB is generous).
 pub const max_body_bytes: usize = 16 * 1024 * 1024;
+/// Cap for a buffered upstream completion. Kept well below the inbound cap:
+/// every buffered response is copied through the request arena, and Windows
+/// never hands a grown page mapping back to the OS, so a large ceiling here is
+/// permanently paid for by each concurrent burst.
+pub const max_upstream_body_bytes: usize = 8 * 1024 * 1024;
+/// A usage event is a few hundred bytes; anything longer in an SSE stream is
+/// model payload and is not worth retaining for scanning.
+const max_usage_line_bytes: usize = 64 * 1024;
 /// Cap for a buffered upstream error body kept for verbatim forwarding.
 pub const max_upstream_error_bytes: usize = 256 * 1024;
 /// Cap for a buffered upstream /v1/models document per provider.
@@ -1212,15 +1223,18 @@ fn routeRequest(
         return try handleModels(self, writer, alloc);
     }
     if (is_post and std.mem.eql(u8, req.path, "/v1/chat/completions")) {
-        return try handleCompletions(self, writer, alloc, req, .chat_completions, provider_out);
+        return try handleCompletions(self, writer, alloc, req, .chat_completions, provider_out, null);
+    }
+    if (is_post and std.mem.eql(u8, req.path, "/v1/responses")) {
+        return try handleResponses(self, writer, alloc, req, provider_out);
     }
     if (is_post and std.mem.eql(u8, req.path, "/v1/completions")) {
-        return try handleCompletions(self, writer, alloc, req, .completions, provider_out);
+        return try handleCompletions(self, writer, alloc, req, .completions, provider_out, null);
     }
     if (is_get and (std.mem.eql(u8, req.path, "/") or std.mem.eql(u8, req.path, "/health"))) {
         return try handleHealth(self, writer);
     }
-    try sendStatus(writer, 404, "unknown endpoint; freepro serves /v1/models and /v1/*completions");
+    try sendStatus(writer, 404, "unknown endpoint; freepro serves /v1/models, /v1/chat/completions, /v1/completions and /v1/responses");
     return 404;
 }
 
@@ -1559,10 +1573,19 @@ const UsageAccum = struct {
             if (byte == '\n') {
                 if (!self.oversized and std.mem.startsWith(u8, self.line.items, "data:"))
                     self.scan(std.mem.trim(u8, self.line.items[5..], " \r\t"));
-                self.line.clearRetainingCapacity();
-                self.oversized = false;
+                if (self.oversized) {
+                    // A line this long is model payload, not usage. Hand the
+                    // capacity back instead of retaining it for the rest of the
+                    // request: a retained multi-megabyte scan buffer is the
+                    // single largest thing a burst leaves behind.
+                    self.line.deinit(self.alloc);
+                    self.line = .empty;
+                    self.oversized = false;
+                } else {
+                    self.line.clearRetainingCapacity();
+                }
             } else if (!self.oversized) {
-                if (self.line.items.len >= max_body_bytes) {
+                if (self.line.items.len >= max_usage_line_bytes) {
                     self.oversized = true;
                     continue;
                 }
@@ -1708,6 +1731,7 @@ fn forwardAttempt(
     alloc: Allocator,
     acc: ?*UsageAccum,
     ctx: *AttemptContext,
+    bridge: ?*codex.Bridge,
 ) !AttemptOutcome {
     const prov = &self.config.providers[provider_idx];
     // Anonymous sentinel: providers with no keys and no authorization header
@@ -1854,7 +1878,12 @@ fn forwardAttempt(
             // streaming would otherwise leave the client hanging with no
             // response until its idle timeout fires (499).
             ctx.committed = true;
-            sendSseHead(writer) catch {
+            var rst: ?codex.Stream = if (bridge) |b| try b.stream(writer) else null;
+            defer if (rst) |*s| s.deinit();
+            if (rst) |*s| s.head() catch {
+                if (proxied) |*pr| pr.ok = null;
+                return error.ClientDisconnected;
+            } else sendSseHead(writer) catch {
                 if (proxied) |*pr| pr.ok = null;
                 return error.ClientDisconnected;
             };
@@ -1891,7 +1920,12 @@ fn forwardAttempt(
                 }
                 if (!started) started = true;
                 if (acc) |a| a.scanSse(chunk[0..n]);
-                sendSseChunk(writer, chunk[0..n]) catch {
+                if (rst) |*s| {
+                    s.feed(chunk[0..n]) catch {
+                        if (proxied) |*pr| pr.ok = null;
+                        return error.ClientDisconnected;
+                    };
+                } else sendSseChunk(writer, chunk[0..n]) catch {
                     if (proxied) |*pr| pr.ok = null;
                     return error.ClientDisconnected;
                 };
@@ -1901,12 +1935,15 @@ fn forwardAttempt(
             if (picked_proxy != null and !stream_done) return error.IncompleteUpstreamStream;
             if (proxied) |*pr| pr.ok = true;
             if (picked_proxy) |picked| self.free_proxies.?.routeStatus(picked, status);
-            sendSseEnd(writer) catch return error.ClientDisconnected;
+            if (rst) |*s| {
+                try s.flushPending();
+                try s.finish();
+            } else sendSseEnd(writer) catch return error.ClientDisconnected;
         } else {
             const raw_body = if (picked_proxy != null)
-                try socketTimed([]u8, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), bufferUpstreamBody, .{ reader, alloc, max_body_bytes })
+                try socketTimed([]u8, req.connection.?.stream_reader.stream, self.io, try ctx.remaining(self.io, @max(1000, self.config.timeout_ms / 2)), bufferUpstreamBody, .{ reader, alloc, max_upstream_body_bytes })
             else
-                try bufferUpstreamBody(reader, alloc, max_body_bytes);
+                try bufferUpstreamBody(reader, alloc, max_upstream_body_bytes);
             if (raw_body.len == 0) return error.EmptyUpstreamResponse;
             const resp_body = if (responses_mode) blk: {
                 const upstream_model = routed_model_of(self.config, alloc, provider_idx, body) orelse "";
@@ -1923,7 +1960,21 @@ fn forwardAttempt(
             if (proxied) |*pr| pr.ok = true;
             if (picked_proxy) |picked| self.free_proxies.?.routeStatus(picked, status);
             ctx.committed = true;
-            if (sse_wanted) {
+            if (bridge) |b| {
+                // The upstream answered with one buffered chat document; the
+                // client asked for the Responses wire either way.
+                if (sse_wanted) {
+                    var s = try b.stream(writer);
+                    defer s.deinit();
+                    try s.head();
+                    try s.feed(try synthChunk(alloc, resp_body, null));
+                    try s.feed(try synthChunk(alloc, resp_body, "stop"));
+                    try s.finish();
+                } else {
+                    const doc = try b.replyJson(resp_body);
+                    sendJson(writer, status, doc) catch return error.ClientDisconnected;
+                }
+            } else if (sse_wanted) {
                 sendSyntheticChat(writer, alloc, resp_body) catch return error.ClientDisconnected;
             } else sendJson(writer, status, resp_body) catch return error.ClientDisconnected;
         }
@@ -1942,6 +1993,33 @@ fn forwardAttempt(
     return .{ .status = status, .body = err_body, .proxy_host = if (picked_proxy) |p| p.host else "", .proxy_port = if (picked_proxy) |p| p.port else 0, .retry_after_ms = retry_after_ms };
 }
 
+// -- POST /v1/responses (Codex CLI / Codex Desktop) ---------------------------
+
+/// Codex only speaks the Responses wire, so the request is translated into a
+/// chat/completions body, run through the ordinary completion pipeline (key
+/// rotation, proxy pool, retries, metrics all unchanged), and the reply is
+/// translated back on the way out by the bridge.
+fn handleResponses(
+    self: *Proxy,
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    req: InboundRequest,
+    provider_out: *?usize,
+) !u16 {
+    const translated = codex.toChatBody(alloc, req.body) catch {
+        try sendStatus(writer, 400, "malformed /v1/responses request body");
+        return 400;
+    };
+    const ms = extractModelAndStream(alloc, translated.body) catch {
+        try sendStatus(writer, 400, "/v1/responses request must name a model");
+        return 400;
+    };
+    var bridge = try codex.Bridge.init(alloc, ms.model, translated.custom_tools);
+    var chat_req = req;
+    chat_req.body = translated.body;
+    return handleCompletions(self, writer, alloc, chat_req, .chat_completions, provider_out, &bridge);
+}
+
 // -- POST /v1/chat/completions + /v1/completions -------------------------------
 
 fn handleCompletions(
@@ -1951,6 +2029,7 @@ fn handleCompletions(
     req: InboundRequest,
     endpoint: UpstreamEndpoint,
     provider_out: *?usize,
+    bridge: ?*codex.Bridge,
 ) !u16 {
     const ms = extractModelAndStream(alloc, req.body) catch {
         try sendStatus(writer, 400, "request body must be JSON with a string \"model\"");
@@ -2014,7 +2093,7 @@ fn handleCompletions(
             pending_failover = null;
         }
 
-        var outcome = forwardAttempt(self, p_idx, key_idx, endpoint, upstream_body, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
+        var outcome = forwardAttempt(self, p_idx, key_idx, endpoint, upstream_body, ms.stream, writer, alloc, &acc, &ctx, bridge) catch |err| {
             if (err == error.ClientDisconnected) {
                 if (ctx.logger) |l| l.info("client disconnected; upstream request will not be replayed", .{});
                 return 499;
@@ -2060,7 +2139,7 @@ fn handleCompletions(
         if (needsThinkingRepair(outcome.status, outcome.body)) {
             const repaired = try thinkingBody(alloc, upstream_body);
             if (ctx.logger) |l| l.info("model requires thinking; retrying once with low effort", .{});
-            outcome = forwardAttempt(self, p_idx, key_idx, endpoint, repaired, ms.stream, writer, alloc, &acc, &ctx) catch |err| {
+            outcome = forwardAttempt(self, p_idx, key_idx, endpoint, repaired, ms.stream, writer, alloc, &acc, &ctx, bridge) catch |err| {
                 if (err == error.ClientDisconnected) return 499;
                 if (ctx.committed) return 502;
                 try sendStatus(writer, if (err == error.Timeout) 504 else 502, "upstream retry failed");
@@ -3350,7 +3429,7 @@ test "public proxy transport failures do not cool or kill API keys" {
     defer writer.deinit();
     var provider: ?usize = null;
     const req = InboundRequest{ .method = "POST", .path = "/v1/chat/completions", .body = "{\"model\":\"test/m\",\"messages\":[]}" };
-    _ = try handleCompletions(&proxy, &writer.writer, arena.allocator(), req, .chat_completions, &provider);
+    _ = try handleCompletions(&proxy, &writer.writer, arena.allocator(), req, .chat_completions, &provider, null);
     // Both routes were leased and failed transport-wise; each has a single
     // transport failure (max_fails=2 keeps them until a second), so they stay
     // pooled but quarantined is not required yet.

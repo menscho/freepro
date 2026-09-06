@@ -784,7 +784,7 @@ pub fn main() !void {
     // App-owned I/O pool: file, stdio, and sleep calls on every thread go
     // through this. Joined (stdin thread) before it is deinitialized: the
     // stdin join is deferred later, so it runs first.
-    var threaded = std.Io.Threaded.init(alloc, .{});
+    var threaded = std.Io.Threaded.init(alloc, .{ .stack_size = models.thread_stack_size });
     defer threaded.deinit();
 
     g.log = logger_mod.Logger.init();
@@ -854,7 +854,7 @@ pub fn main() !void {
         g.log.info("auto-start off; type 'start' to launch the proxy, 'help' for commands", .{});
     }
 
-    var stdin_thread = try std.Thread.spawn(.{}, stdinThreadMain, .{});
+    var stdin_thread = try std.Thread.spawn(.{ .stack_size = models.thread_stack_size }, stdinThreadMain, .{});
     defer stdin_thread.join();
 
     // Foreground GUI loop: refresh view state, render one frame, autosave.

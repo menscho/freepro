@@ -21,6 +21,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Zig's 16 MiB Windows default is far more than these loops need; see
+/// models.thread_stack_size.
+const thread_stack_size: usize = 2 * 1024 * 1024;
+
 comptime {
     if (builtin.os.tag != .windows) {
         @compileError("netwin.zig is Windows-only; other platforms use std.Io.net");
@@ -370,7 +374,7 @@ test "winsock loopback roundtrip" {
             wr.interface.flush() catch return;
         }
     };
-    const th = try std.Thread.spawn(.{}, T.run, .{&server});
+    const th = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, T.run, .{&server});
 
     var cli = try addr.connect(std.testing.io, .{});
     defer cli.close(std.testing.io);

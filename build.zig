@@ -12,6 +12,8 @@ const module_names = [_][]const u8{
     "netwin",
     "freeproxy",
     "responses",
+    "codex",
+    "codexadd",
     "dashboard",
     "updater",
     "ui",
