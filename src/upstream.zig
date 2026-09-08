@@ -55,6 +55,7 @@
 // only), precisely to avoid the 0.13-managed / 0.15+-unmanaged split.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const models = @import("models.zig");
 
 const Allocator = std.mem.Allocator;
@@ -108,12 +109,17 @@ pub const Endpoint = enum {
 
 /// Wall-clock milliseconds since the Unix epoch. Exposed so proxy.zig /
 /// metrics.zig can stamp request logs with the same clock family this module
-/// reports in. Uses the process-wide single-threaded Io (clock reads are
-/// non-blocking plain syscalls, safe from any thread).
+/// reports in. Uses a direct OS clock read so it is safe from any thread,
+/// including proxy worker threads that must not touch the global Io.
 pub fn nowMs() i64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.Timestamp.now(io, .real);
-    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+    if (@hasDecl(std.time, "milliTimestamp")) return std.time.milliTimestamp();
+    if (builtin.os.tag == .windows) {
+        const ticks_100ns: i64 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+        return @divFloor(ticks_100ns, 10_000) - 11_644_473_600_000;
+    }
+    var ts: std.posix.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1_000 + @divFloor(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 /// Milliseconds elapsed since `start_ms` (see nowMs). Wall clock: fine for

@@ -145,12 +145,14 @@ pub fn toChatBody(alloc: Allocator, req: []const u8) !Translated {
         if (tv == .array) {
             var written: usize = 0;
             var body_buf: std.ArrayList(u8) = .empty;
+            errdefer body_buf.deinit(alloc);
             try writeTools(alloc, &body_buf, tv, &custom, &written);
             if (written != 0) {
                 try out.appendSlice(alloc, ",\"tools\":[");
                 try out.appendSlice(alloc, body_buf.items);
                 try out.appendSlice(alloc, "]");
             }
+            body_buf.deinit(alloc);
         }
     }
 
@@ -219,10 +221,17 @@ pub fn toChatBody(alloc: Allocator, req: []const u8) !Translated {
     }
     try out.appendSlice(alloc, "}");
 
-    return .{
-        .body = try out.toOwnedSlice(alloc),
-        .custom_tools = try custom.toOwnedSlice(alloc),
-    };
+    const body = try out.toOwnedSlice(alloc);
+    const custom_tools = try custom.toOwnedSlice(alloc);
+
+    // Deinit intermediate messages: their owned strings (text/parts/calls)
+    // were borrowed during rendering and are no longer needed.
+    for (msgs.items) |*m| {
+        if (m.calls) |*c| c.deinit(alloc);
+    }
+    msgs.deinit(alloc);
+
+    return .{ .body = body, .custom_tools = custom_tools };
 }
 
 /// Append one `input` item to the message list. Unknown/unmappable item types
@@ -278,6 +287,7 @@ fn pushInputItem(alloc: Allocator, msgs: *std.ArrayList(Msg), item: std.json.Val
         }
         if (only_text) {
             try msgs.append(alloc, .{ .role = mapped, .text = text.items });
+            text.deinit(alloc);
         } else {
             // Keep the text we collected too, so a mixed turn does not lose it.
             if (text.items.len != 0) {
@@ -286,6 +296,7 @@ fn pushInputItem(alloc: Allocator, msgs: *std.ArrayList(Msg), item: std.json.Val
                 try appendQuoted(alloc, &parts, text.items);
                 try parts.appendSlice(alloc, "}");
             }
+            text.deinit(alloc);
             try msgs.append(alloc, .{ .role = mapped, .parts = try parts.toOwnedSlice(alloc) });
         }
         return;
@@ -602,6 +613,8 @@ pub const Bridge = struct {
 
         var items: usize = 0;
         var text: []const u8 = "";
+        var text_acc: std.ArrayList(u8) = .empty;
+        defer text_acc.deinit(self.alloc);
         var calls: ?std.json.Value = null;
         if (root.get("choices")) |cv| {
             if (cv == .array and cv.array.items.len != 0) {
@@ -613,16 +626,15 @@ pub const Bridge = struct {
                                 switch (ct) {
                                     .string => text = ct.string,
                                     .array => {
-                                        var acc: std.ArrayList(u8) = .empty;
                                         for (ct.array.items) |part| {
                                             if (part == .object) {
                                                 if (strField(part.object, "text")) |t| {
-                                                    if (acc.items.len != 0) try acc.appendSlice(self.alloc, "\n");
-                                                    try acc.appendSlice(self.alloc, t);
+                                                    if (text_acc.items.len != 0) try text_acc.appendSlice(self.alloc, "\n");
+                                                    try text_acc.appendSlice(self.alloc, t);
                                                 }
                                             }
                                         }
-                                        text = acc.items;
+                                        text = text_acc.items;
                                     },
                                     else => {},
                                 }
