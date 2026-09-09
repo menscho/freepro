@@ -223,7 +223,7 @@ fn sharedIo() std.Io {
 ///              latency_ms: u64) void
 pub const Logger = struct {
     ctx: *anyopaque,
-    vtable: *const VTable,
+    vtable: VTable,
     request_id: u64 = 0,
     attempt: usize = 0,
 
@@ -270,7 +270,7 @@ pub const Logger = struct {
             .failover = Adapters.failover,
             .log_request = Adapters.logRequest,
         };
-        return .{ .ctx = ptr, .vtable = &vt };
+        return .{ .ctx = ptr, .vtable = vt };
     }
 
     pub fn info(self: Logger, comptime fmt: []const u8, args: anytype) void {
@@ -319,7 +319,7 @@ pub const Logger = struct {
 ///   noteFailover() void
 pub const Metrics = struct {
     ctx: *anyopaque,
-    vtable: *const VTable,
+    vtable: VTable,
 
     pub const VTable = struct {
         begin: *const fn (ctx: *anyopaque) void,
@@ -365,7 +365,7 @@ pub const Metrics = struct {
             .record_usage = if (@hasDecl(C, "recordUsage")) Adapters.recordUsage else null,
             .record_model_usage = if (@hasDecl(C, "recordModelUsage")) Adapters.recordModelUsage else null,
         };
-        return .{ .ctx = ptr, .vtable = &vt };
+        return .{ .ctx = ptr, .vtable = vt };
     }
 
     /// Mark the start of one proxied request. Always pair with end().
@@ -1411,10 +1411,16 @@ fn bufferUpstreamBody(reader: *std.Io.Reader, alloc: Allocator, cap: usize) ![]u
     var body: std.ArrayList(u8) = .empty;
     var chunk: [32768]u8 = undefined;
     while (true) {
-        const n = try reader.readSliceShort(&chunk);
+        const n = reader.readSliceShort(&chunk) catch |err| switch (err) {
+            error.ReadFailed => return err,
+        };
         if (n == 0) break;
         if (body.items.len + n > cap) return ProxyError.BodyTooLarge;
         try body.appendSlice(alloc, chunk[0..n]);
+        // readSliceShort returns fewer than chunk.len only when the stream
+        // reached EOF. The std http body reader transitions to .ready on EOF,
+        // so calling it again would panic on a union-tag mismatch. Stop here.
+        if (n < chunk.len) break;
     }
     return body.items;
 }

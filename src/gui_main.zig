@@ -33,7 +33,7 @@ const updater_mod = @import("updater.zig");
 /// which floods the console in serve mode; the dashboard already logs a
 /// per-provider warning instead. Keep the dump out of release-style runs.
 pub const std_options: std.Options = .{
-    .unexpected_error_tracing = false,
+    .allow_stack_tracing = false,
 };
 
 // ---------------------------------------------------------------------------

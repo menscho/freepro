@@ -80,7 +80,7 @@ const models_console = @import("ui/views_models_console.zig");
 /// std debug handler would print an NTSTATUS dump per call. The headless
 /// console already surfaces per-provider warnings instead.
 pub const std_options: std.Options = .{
-    .unexpected_error_tracing = false,
+    .allow_stack_tracing = false,
 };
 
 const have_rotator = @hasDecl(rotator_mod, "Rotator");
